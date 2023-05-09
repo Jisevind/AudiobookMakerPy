@@ -12,6 +12,20 @@ The script performs the following key tasks:
 
 To use this script, make sure to have FFmpeg, MP4Box, and Python installed in your environment. 
 
+Download from here:
+
+Python:
+
+https://www.python.org/
+
+FFmpeg:
+
+https://ffmpeg.org/
+
+MP4Box: 
+
+https://gpac.wp.imt.fr/downloads/
+
 ## Usage
 
 You can run the script from the command line as follows:
@@ -52,13 +66,3 @@ The script will output an **'.m4b'** file in the same directory as the first inp
 * The script handles errors gracefully and logs any issues during the processing of the files. Please check the log file for troubleshooting any issues.
 * The script uses a temporary directory for intermediate files which is deleted at the end of the process. If the script is interrupted or an error occurs, you may need to manually delete this directory.
 * The script assumes that FFmpeg, MP4Box and the necessary Python packages are installed and available in your system's PATH. Please ensure you have these installed and configured correctly.
-
-Download from here:
-
-FFmpeg:
-
-https://ffmpeg.org/
-
-MP4Box: 
-
-https://gpac.wp.imt.fr/downloads/
