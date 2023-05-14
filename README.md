@@ -4,7 +4,7 @@ This script is designed to concatenate multiple audio files and convert them int
 The script performs the following key tasks:
 
 1. **Retrieve audio properties**: It extracts information about the audio codec, sample rate, number of channels, and bitrate of the input files.
-2. **Audio file conversion**: It converts the input audio files to AAC format while preserving the original bitrate.
+2. **Audio file conversion**: It converts the input audio files to AAC format while preserving the original bitrate. The conversion is done with parallel processing to speed things up, it uses all available cores by default.
 3. **Concatenation of audio files**: It concatenates the converted audio files in the order they are provided. It also adds chapter markers based on the individual files.
 4. **Copy metadata**: It copies the metadata from the first input file.
 5. **Error handling and logging**: It handles potential errors during the process and logs useful information for troubleshooting purposes.

@@ -8,16 +8,10 @@ import re
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
+# Number of cores to use for parallel processing, use all available cores by default
+max_cpu_cores = os.cpu_count()
+
 tempdir = None
-
-# Get current date and time
-now = datetime.now()
-
-# Convert date and time to string
-dt_string = now.strftime("%Y-%m-%d_%H-%M-%S")
-
-# Set up logging to a file
-logging.basicConfig(filename=f'logfile_{dt_string}.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def atoi(text):
     # Converts a digit string to an integer, otherwise returns the original string
@@ -61,11 +55,8 @@ def ms_to_timestamp(ms):
     minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     return f"{hours:02}:{minutes:02}:{seconds:02}.{ms:03}"
-    
-def convert_to_aac(input_file, output_file, bitrate):
-    # Log the start of the conversion process
-    logging.info(f'Converting {input_file} to AAC')
 
+def convert_to_aac(input_file, output_file, bitrate):
     # Prepare the command for ffmpeg to convert the input file to AAC format
     ffmpeg_command = ['ffmpeg', '-i', input_file, '-vn', '-acodec', 'aac', '-b:a', f'{bitrate}k', '-ar', '44100', '-ac', '2', output_file]
 
@@ -94,7 +85,6 @@ def convert_to_aac(input_file, output_file, bitrate):
     return output_file
 
 def create_metadata_file(tempdir, input_files, durations):
-    logging.info('Creating metadata file')
     # Define the path of the metadata file
     metadata_file = os.path.join(tempdir, 'chapters.txt')
 
@@ -151,8 +141,6 @@ def copy_metadata(input_file, output_file):
 def concatenate_audio_files(input_files, output_file):
     global tempdir
 
-    logging.info(f'Concatenating {len(input_files)} files')
-
     durations = []
     audio_properties = []
     
@@ -170,15 +158,19 @@ def concatenate_audio_files(input_files, output_file):
     tempdir = tempfile.mkdtemp()
 
     try:
-        with ProcessPoolExecutor() as executor:
+        with ProcessPoolExecutor(max_workers=max_cpu_cores) as executor:
+            # Log the start of the conversion process
+            logging.info(f'Converting {len(input_files)} files to AAC')
             # Define a list of future tasks for conversion
             future_tasks = [executor.submit(convert_to_aac, input_file, os.path.join(tempdir, os.path.splitext(os.path.basename(input_file))[0] + '_converted.m4a'), properties['bit_rate'] // 1000)
                             for input_file, properties in zip(input_files, audio_properties)]
             # Update the input files with the results of the tasks
             input_files = [future.result() for future in future_tasks]
 
+        logging.info('Creating metadata file')
         metadata_file = create_metadata_file(tempdir, input_files, durations)
 
+        logging.info(f'Concatenating {len(input_files)} files')
         mp4box_concat_command = ['MP4Box', '-force-cat', '-chap', metadata_file] + [arg for f in input_files for arg in ['-cat', f]] + [output_file]
         subprocess.run(mp4box_concat_command, check=True)
 
@@ -188,6 +180,16 @@ def concatenate_audio_files(input_files, output_file):
         sys.exit(1)
 
 if __name__ == '__main__':
+
+    # Get current date and time
+    now = datetime.now()
+
+    # Convert date and time to string
+    dt_string = now.strftime("%Y-%m-%d_%H-%M-%S")
+
+    # Set up logging to a file
+    logging.basicConfig(filename=f'logfile_{dt_string}.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
     if len(sys.argv) < 2:
         print("Usage: python AudiobookMakerPy.py <input_path> [<input_path2> <input_path3> ...]")
         logging.error("Invalid number of input paths")
@@ -215,8 +217,11 @@ if __name__ == '__main__':
     concatenate_audio_files(input_files, output_file)
     copy_metadata(input_files[0], output_file)
 
+    logging.info(f'Removing temporary directory - {tempdir}')
     # Now remove the temporary directory
     shutil.rmtree(tempdir)
+
+    logging.info('Audiobook creation complete.')
 
 class ConversionError(Exception):
     """Raised when there is a problem with audio file conversion."""
