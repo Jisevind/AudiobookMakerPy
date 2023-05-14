@@ -205,7 +205,7 @@ def concatenate_audio_files(input_files, output_file):
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: python mp4box_to_m4b.py <input_path> [<input_path2> <input_path3> ...]")
+        print("Usage: python AudiobookMakerPy.py <input_path> [<input_path2> <input_path3> ...]")
         logging.error("Invalid number of input paths")
         sys.exit(1)
 

@@ -46,6 +46,20 @@ With `AudioBookMakerPy.bat`, you can simply drag and drop a folder or individual
    - If you drop a folder, the script will process all supported audio files in the directory.
    - If you drop individual files, the script will process and concatenate those files in the order they were selected.
 
+## Preparing Your Files
+
+Before running the script, it's important to properly name your audio files. This will ensure they are processed in the correct order and the resulting audiobook file is structured correctly.
+
+Here are some guidelines for naming your files:
+
+1. **File Order**: Files are processed in alphanumeric order. This means a file named 'Chapter1.mp3' will be processed before 'Chapter2.mp3', 'Chapter10.mp3', etc. Make sure the filenames reflect the order you want them to appear in the final audiobook.
+
+2. **Numbering**: When numbering files, it's recommended to use leading zeros for numbers less than 10 (and less than 100 for books with more than 99 chapters). For example, use 'Chapter01.mp3', 'Chapter02.mp3', ..., 'Chapter10.mp3', etc. This ensures the files are sorted correctly by the script.
+
+3. **Special Cases**: If there are multiple parts or versions of the same chapter or section, you can denote this in the filename using parentheses. For example, 'Chapter01(1).mp3', 'Chapter01(2).mp3', etc. Please note that the script treats the parentheses and the number inside as a single part, so 'Chapter01(2).mp3' will come after 'Chapter01.mp3' and 'Chapter01(1).mp3'.
+
+By properly naming your files, you can ensure the script processes them correctly and the final audiobook is structured as intended.
+
 **Note:** 
 
 - The `AudioBookMakerPy.bat` batch file should be located in the same directory as your Python script for this to work. It's already provided, so you don't need to create it.
