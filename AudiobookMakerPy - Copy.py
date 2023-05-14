@@ -6,7 +6,6 @@ import logging
 import shutil
 import re
 from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor
 
 tempdir = None
 
@@ -35,15 +34,17 @@ def get_audio_duration(input_file):
         return int(float(output) * 1000)  # convert duration from seconds to milliseconds
     except subprocess.CalledProcessError as e:
         logging.error(f'Error occurred while getting duration for {input_file}: {str(e)}')
-        raise AudioDurationError(f"Getting duration of {input_file} failed.") from e
+        return None
 
 def get_audio_properties(input_file):
     logging.info(f'Getting properties for {input_file}')
     # Define ffprobe command to extract audio properties
     ffprobe_command = ['ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_name,sample_rate,channels,bit_rate', '-of', 'csv=p=0', input_file]
+
     try:
         # Execute command and decode output
         output = subprocess.check_output(ffprobe_command).decode('utf-8').strip().split(',')
+
         # Return a dictionary of properties
         return {
             'codec': output[0],           # Audio codec (e.g., mp3, aac)
@@ -53,7 +54,7 @@ def get_audio_properties(input_file):
         }
     except subprocess.CalledProcessError as e:
         logging.error(f'Error occurred while getting properties for {input_file}: {str(e)}')
-        raise AudioPropertiesError(f"Getting properties of {input_file} failed.") from e
+        return None
 
 def ms_to_timestamp(ms):
     # convert milliseconds to timestamp format (HH:MM:SS.mmm)
@@ -65,10 +66,10 @@ def ms_to_timestamp(ms):
 def convert_to_aac(input_file, output_file, bitrate):
     # Log the start of the conversion process
     logging.info(f'Converting {input_file} to AAC')
-
+    
     # Prepare the command for ffmpeg to convert the input file to AAC format
-    ffmpeg_command = ['ffmpeg', '-i', input_file, '-vn', '-acodec', 'aac', '-b:a', f'{bitrate}k', '-ar', '44100', '-ac', '2', output_file]
-
+    ffmpeg_command = ['ffmpeg', '-i', input_file, '-vn', '-acodec', 'libfdk_aac', '-b:a', f'{bitrate}k', '-ar', '44100', '-ac', '2', output_file]
+    
     try:
         # Run the ffmpeg command
         subprocess.run(ffmpeg_command, check=True)
@@ -82,14 +83,14 @@ def convert_to_aac(input_file, output_file, bitrate):
     except subprocess.CalledProcessError as e:
         # Log the error if there's an issue with the conversion process
         logging.error(f'Error occurred while converting {input_file} to AAC: {str(e)}')
-
+        
         # Check if the output file was created
         if os.path.exists(output_file):
             # If it was created, remove it because the conversion process was not successful
             os.remove(output_file)
-
+        
         # Raise an exception to stop the script due to the error
-        raise ConversionError(f"Conversion of {input_file} failed.") from e
+        raise Exception("Aborting script.")
 
     return output_file
 
@@ -145,47 +146,62 @@ def copy_metadata(input_file, output_file):
             # If it was created, remove it because the metadata copying process was not successful
             os.remove(output_temp_file)
         
-        # Raise an exception to stop the script due to the error
-        raise MetadataError(f"Copying metadata from {input_file} to {output_file} failed.") from e
+        # Don't raise an exception, just log the error and continue
+        logging.info('Continuing script execution despite error.')
 
 def concatenate_audio_files(input_files, output_file):
     global tempdir
 
+    # Log the start of the concatenation process
     logging.info(f'Concatenating {len(input_files)} files')
 
-    durations = []
-    audio_properties = []
+    durations = []  # List to store the duration of each audio file
+    audio_properties = []  # List to store the properties of each audio file
     
+    # Loop through each input file
     for f in input_files:
+        # Get the duration and properties of the current audio file
         duration = get_audio_duration(f)
         properties = get_audio_properties(f)
 
+        # If the duration or properties could not be retrieved, log an error and skip this file
         if duration is None or properties is None:
             logging.error(f'Skipping {f} due to error')
             continue
 
+        # Append the duration and properties to their respective lists
         durations.append(duration)
         audio_properties.append(properties)
 
+    # Create a temporary directory to store the converted audio files
     tempdir = tempfile.mkdtemp()
 
     try:
-        with ProcessPoolExecutor() as executor:
-            # Define a list of future tasks for conversion
-            future_tasks = [executor.submit(convert_to_aac, input_file, os.path.join(tempdir, os.path.splitext(os.path.basename(input_file))[0] + '_converted.m4a'), properties['bit_rate'] // 1000)
-                            for input_file, properties in zip(input_files, audio_properties)]
-            # Update the input files with the results of the tasks
-            input_files = [future.result() for future in future_tasks]
+        # Loop through each input file
+        for i, input_file in enumerate(input_files):
+            # Define the path of the converted file
+            converted_file = os.path.join(tempdir, os.path.splitext(os.path.basename(input_file))[0] + '_converted.m4a')
+            # Convert the current audio file to AAC format and update the list of input files
+            converted_file = convert_to_aac(input_file, converted_file, audio_properties[i]['bit_rate'] // 1000)
+            input_files[i] = converted_file
 
+        # Create a metadata file with chapters based on the durations of the audio files
         metadata_file = create_metadata_file(tempdir, input_files, durations)
 
+        # Prepare the command for MP4Box to concatenate the audio files and add chapters
         mp4box_concat_command = ['MP4Box', '-force-cat', '-chap', metadata_file] + [arg for f in input_files for arg in ['-cat', f]] + [output_file]
+        # Run the MP4Box command
         subprocess.run(mp4box_concat_command, check=True)
 
-    except ConversionError as e:
-        logging.error(f'A conversion error occurred: {str(e)}')
+    except Exception as e:
+        # Log the error and clean up the temporary directory if an error occurs
+        logging.error(f'An error occurred: {str(e)}')
         shutil.rmtree(tempdir)
+        # Exit the script due to the error
         sys.exit(1)
+
+    # Clean up the temporary directory after the concatenation process is complete
+    # shutil.rmtree(tempdir)
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
@@ -217,19 +233,3 @@ if __name__ == '__main__':
 
     # Now remove the temporary directory
     shutil.rmtree(tempdir)
-
-class ConversionError(Exception):
-    """Raised when there is a problem with audio file conversion."""
-    pass
-
-class AudioDurationError(Exception):
-    """Raised when there is a problem getting the duration of an audio file."""
-    pass
-
-class AudioPropertiesError(Exception):
-    """Raised when there is a problem getting the properties of an audio file."""
-    pass
-
-class MetadataError(Exception):
-    """Raised when there is a problem with copying metadata from one file to another."""
-    pass
