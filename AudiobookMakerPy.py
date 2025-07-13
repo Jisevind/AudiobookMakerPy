@@ -8,6 +8,7 @@ import shutil
 import re
 import hashlib
 import json
+import time
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
@@ -161,6 +162,73 @@ def create_predictable_temp_dir(input_files, output_file, bitrate="128k"):
     
     logging.info(f"Using job directory: {temp_dir}")
     return temp_dir
+
+def cleanup_old_cache_directories(max_age_days=30):
+    """
+    Clean up old cache directories to prevent disk space accumulation.
+    
+    Phase 4.3: Intelligent Caching - automatic cache management per Gemini's insights.
+    Removes audiobookmaker_* directories older than specified age.
+    
+    Args:
+        max_age_days (int): Maximum age in days before cleanup
+        
+    Returns:
+        tuple: (directories_removed, space_freed_mb)
+    """
+    temp_base = tempfile.gettempdir()
+    current_time = time.time()
+    max_age_seconds = max_age_days * 24 * 60 * 60
+    
+    directories_removed = 0
+    space_freed_bytes = 0
+    
+    try:
+        for item in os.listdir(temp_base):
+            if item.startswith("audiobookmaker_"):
+                dir_path = os.path.join(temp_base, item)
+                
+                if os.path.isdir(dir_path):
+                    # Check last access time
+                    try:
+                        stat_info = os.stat(dir_path)
+                        last_access = stat_info.st_atime
+                        age_seconds = current_time - last_access
+                        
+                        if age_seconds > max_age_seconds:
+                            # Calculate size before deletion
+                            dir_size = 0
+                            for root, dirs, files in os.walk(dir_path):
+                                for file in files:
+                                    file_path = os.path.join(root, file)
+                                    try:
+                                        dir_size += os.path.getsize(file_path)
+                                    except (OSError, IOError):
+                                        pass
+                            
+                            # Remove the directory
+                            shutil.rmtree(dir_path)
+                            directories_removed += 1
+                            space_freed_bytes += dir_size
+                            
+                            logging.info(f"Cleaned up old cache directory: {dir_path} "
+                                       f"(age: {age_seconds/86400:.1f} days, size: {dir_size/(1024*1024):.1f}MB)")
+                                       
+                    except (OSError, IOError) as e:
+                        logging.warning(f"Could not check/remove cache directory {dir_path}: {e}")
+                        
+    except (OSError, IOError) as e:
+        logging.warning(f"Could not access temp directory for cache cleanup: {e}")
+    
+    space_freed_mb = space_freed_bytes / (1024 * 1024)
+    
+    if directories_removed > 0:
+        logging.info(f"Cache cleanup completed: {directories_removed} directories removed, "
+                    f"{space_freed_mb:.1f}MB freed")
+    else:
+        logging.debug("Cache cleanup: no old directories found")
+    
+    return directories_removed, space_freed_mb
 
 def create_receipt_file(input_file, temp_dir):
     """
@@ -1007,13 +1075,15 @@ def _add_chapters_to_file(audiofile, chapters):
 def process_audio_files(input_files, output_file, bitrate="128k", cores=None, progress_tracker=None, resume_mode="auto"):
     """Processes audio files with comprehensive resource management and resume functionality.
 
-    This function implements Phase 2.4 resource management and Phase 3.4 resume functionality:
+    This function implements Phase 2.4 resource management, Phase 3.4 resume functionality,
+    and Phase 4.3 intelligent caching (merged per Gemini's insights):
     - Memory usage monitoring and limits
     - Disk space verification  
     - Guaranteed cleanup of temporary files
     - Signal handling for graceful shutdown
     - Predictable temporary directories for resume capability
-    - Existing conversion detection and validation
+    - Existing conversion detection and validation (intelligent caching)
+    - Automatic cleanup of old cache directories
 
     Args:
         input_files (list): List of paths to input audio files.
@@ -1026,6 +1096,14 @@ def process_audio_files(input_files, output_file, bitrate="128k", cores=None, pr
         tuple: (durations_list, errors_list) - Successfully processed durations and any errors encountered.
     """
     global tempdir
+    
+    # Phase 4.3: Automatic cache cleanup (merged with Resume Functionality per Gemini's insights)
+    try:
+        removed, freed_mb = cleanup_old_cache_directories(max_age_days=30)
+        if removed > 0:
+            logging.info(f"Automatic cache cleanup: removed {removed} old directories, freed {freed_mb:.1f}MB")
+    except Exception as e:
+        logging.warning(f"Cache cleanup failed: {e}")
     
     # Phase 3.4: Handle resume modes and create temporary directory
     if resume_mode == "never":
@@ -1276,6 +1354,11 @@ Phase 4.2 - Adaptive Parallelism Configuration:
   Create ~/.audiobookmaker_config.json with: {"max_cpu_cores": 4}
   Command-line --cores argument always overrides config file setting
 
+Phase 4.3 - Intelligent Caching (merged with Resume Functionality):
+  python AudiobookMakerPy.py /path/to/files/ --clear-cache  # Clear cache before processing
+  python AudiobookMakerPy.py /path/to/files/ --clear        # Short form for cache clearing
+  # Automatic cleanup of cache directories older than 30 days occurs on each run
+
 Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         """
     )
@@ -1379,6 +1462,13 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         help='Resume behavior: auto (resume if possible), never (always start fresh), force (fail if cannot resume)'
     )
     
+    # Phase 4.3: Intelligent Caching (merged with Resume Functionality per Gemini's insights)
+    parser.add_argument(
+        '--clear-cache', '--clear',
+        action='store_true',
+        help='Clear cached conversion results before processing (equivalent to --resume never)'
+    )
+    
     parser.add_argument(
         '--version', '-v',
         action='version',
@@ -1386,6 +1476,11 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
     )
     
     args = parser.parse_args()
+    
+    # Phase 4.3: Handle --clear-cache argument (merged with Resume Functionality)
+    if args.clear_cache:
+        args.resume = 'never'
+        logging.info("Cache clearing requested: setting resume mode to 'never'")
     
     # Phase 3.2: Process quality presets
     quality_presets = {
