@@ -6,6 +6,8 @@ import tempfile
 import logging
 import shutil
 import re
+import hashlib
+import json
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
@@ -64,6 +66,136 @@ def cleanup_temp_files(temp_directory):
             logging.info(f"Emergency cleanup completed: {temp_directory}")
         except Exception as e:
             logging.error(f"Failed emergency cleanup: {e}")
+
+def create_job_hash(input_files, output_file, bitrate="128k"):
+    """
+    Create a predictable hash for job identification and resume functionality.
+    
+    Phase 3.4: Generates consistent hash based on input files, output path, and processing parameters
+    to enable resume functionality through predictable temporary directory naming.
+    
+    Args:
+        input_files (list): List of input file paths
+        output_file (str): Path to output audiobook file
+        bitrate (str): Processing bitrate parameter
+        
+    Returns:
+        str: SHA256 hash for job identification
+    """
+    # Create deterministic string from all inputs
+    job_data = {
+        'input_files': sorted([os.path.abspath(f) for f in input_files]),  # Sort for consistency
+        'output_file': os.path.abspath(output_file),
+        'bitrate': bitrate,
+        'version': '3.4'  # Version for future compatibility
+    }
+    
+    # Convert to JSON string for hashing
+    job_string = json.dumps(job_data, sort_keys=True)
+    
+    # Create SHA256 hash
+    job_hash = hashlib.sha256(job_string.encode('utf-8')).hexdigest()[:16]  # First 16 chars for readability
+    
+    logging.debug(f"Created job hash: {job_hash} for {len(input_files)} files")
+    return job_hash
+
+def create_predictable_temp_dir(input_files, output_file, bitrate="128k"):
+    """
+    Create a predictable temporary directory for resume functionality.
+    
+    Phase 3.4: Uses job hash to create consistent temp directory names,
+    enabling resume functionality by reusing existing processed files.
+    
+    Args:
+        input_files (list): List of input file paths
+        output_file (str): Path to output audiobook file
+        bitrate (str): Processing bitrate parameter
+        
+    Returns:
+        str: Path to the predictable temporary directory
+    """
+    job_hash = create_job_hash(input_files, output_file, bitrate)
+    temp_base = tempfile.gettempdir()
+    temp_dir = os.path.join(temp_base, f"audiobookmaker_{job_hash}")
+    
+    # Create directory if it doesn't exist
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    logging.info(f"Using job directory: {temp_dir}")
+    return temp_dir
+
+def create_receipt_file(input_file, temp_dir):
+    """
+    Create a receipt file to track input file state for resume validation.
+    
+    Phase 3.4: Stores modification time and file size to detect changes
+    in source files since last processing attempt.
+    
+    Args:
+        input_file (str): Path to the input audio file
+        temp_dir (str): Temporary directory for receipt files
+    """
+    try:
+        file_stats = os.stat(input_file)
+        receipt_data = {
+            'file_path': os.path.abspath(input_file),
+            'modification_time': file_stats.st_mtime,
+            'file_size': file_stats.st_size,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Receipt file name based on input file
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        receipt_file = os.path.join(temp_dir, f"{base_name}.receipt")
+        
+        with open(receipt_file, 'w', encoding='utf-8') as f:
+            json.dump(receipt_data, f, indent=2)
+            
+        logging.debug(f"Created receipt for {input_file}: {receipt_file}")
+        
+    except Exception as e:
+        logging.warning(f"Failed to create receipt for {input_file}: {e}")
+
+def validate_receipt_file(input_file, temp_dir):
+    """
+    Validate that input file hasn't changed since receipt was created.
+    
+    Phase 3.4: Checks modification time and file size against stored receipt
+    to determine if cached conversion result is still valid.
+    
+    Args:
+        input_file (str): Path to the input audio file
+        temp_dir (str): Temporary directory containing receipt files
+        
+    Returns:
+        bool: True if file is unchanged, False if changed or no receipt exists
+    """
+    try:
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        receipt_file = os.path.join(temp_dir, f"{base_name}.receipt")
+        
+        if not os.path.exists(receipt_file):
+            logging.debug(f"No receipt found for {input_file}")
+            return False
+            
+        with open(receipt_file, 'r', encoding='utf-8') as f:
+            receipt_data = json.load(f)
+            
+        # Check current file stats
+        current_stats = os.stat(input_file)
+        
+        # Validate file hasn't changed
+        if (receipt_data['modification_time'] == current_stats.st_mtime and
+            receipt_data['file_size'] == current_stats.st_size):
+            logging.debug(f"Receipt valid for {input_file}")
+            return True
+        else:
+            logging.info(f"File changed since last processing: {input_file}")
+            return False
+            
+    except Exception as e:
+        logging.warning(f"Failed to validate receipt for {input_file}: {e}")
+        return False
 
 def extract_metadata_for_template(input_files):
     """
@@ -828,28 +960,71 @@ def _add_chapters_to_file(audiofile, chapters):
         logging.warning(f'Could not add chapters to file: {str(e)}')
         # Continue without chapters rather than failing completely
 
-def process_audio_files(input_files, output_file, bitrate="128k", cores=None, progress_tracker=None):
-    """Processes audio files with comprehensive resource management.
+def process_audio_files(input_files, output_file, bitrate="128k", cores=None, progress_tracker=None, resume_mode="auto"):
+    """Processes audio files with comprehensive resource management and resume functionality.
 
-    This function implements Phase 2.4 resource management including:
+    This function implements Phase 2.4 resource management and Phase 3.4 resume functionality:
     - Memory usage monitoring and limits
-    - Disk space verification
+    - Disk space verification  
     - Guaranteed cleanup of temporary files
     - Signal handling for graceful shutdown
+    - Predictable temporary directories for resume capability
+    - Existing conversion detection and validation
 
     Args:
         input_files (list): List of paths to input audio files.
         output_file (str): Path to output audio file.
         bitrate (str): Bitrate for conversion (default: 128k).
         cores (int): Number of CPU cores to use.
+        resume_mode (str): Resume behavior - 'auto', 'never', or 'force'.
 
     Returns:
         tuple: (durations_list, errors_list) - Successfully processed durations and any errors encountered.
     """
     global tempdir
     
-    # Use managed processing context for comprehensive resource management
-    with managed_processing(input_files, monitor_resources=True) as context:
+    # Phase 3.4: Handle resume modes and create temporary directory
+    if resume_mode == "never":
+        # Force fresh start - clear any existing predictable temp directory
+        predictable_temp_dir = create_predictable_temp_dir(input_files, output_file, bitrate)
+        if os.path.exists(predictable_temp_dir):
+            try:
+                shutil.rmtree(predictable_temp_dir)
+                logging.info(f"Cleared previous job directory due to --resume never")
+                # Recreate clean directory
+                os.makedirs(predictable_temp_dir, exist_ok=True)
+            except Exception as e:
+                logging.warning(f"Failed to clear previous job directory: {e}")
+    else:
+        # Create predictable temporary directory for resume functionality  
+        predictable_temp_dir = create_predictable_temp_dir(input_files, output_file, bitrate)
+    
+    # Check for existing conversions to detect resume scenario (unless "never" mode)
+    existing_conversions = []
+    total_files = len(input_files)
+    
+    if resume_mode != "never":
+        for input_file in input_files:
+            base_name = os.path.splitext(os.path.basename(input_file))[0]
+            temp_file = os.path.join(predictable_temp_dir, f"{base_name}_converted.m4a")
+            if os.path.exists(temp_file) and validate_receipt_file(input_file, predictable_temp_dir):
+                existing_conversions.append(input_file)
+    
+    # Handle force mode
+    if resume_mode == "force":
+        if not existing_conversions:
+            raise ProcessingError("Resume forced but no resumable work found", "resume_validation")
+        logging.info(f"Forced resume: {len(existing_conversions)}/{total_files} files will be resumed")
+    
+    # Notify user of resume scenario  
+    if existing_conversions and resume_mode != "never":
+        logging.info(f"Resume detected: {len(existing_conversions)}/{total_files} files already converted")
+        if not progress_tracker:
+            print(f"Resume detected: {len(existing_conversions)}/{total_files} files already converted")
+            print(f"Skipping {len(existing_conversions)} files, converting {total_files - len(existing_conversions)} remaining files")
+    
+    # Use managed processing context with our predictable temp directory
+    with managed_processing(input_files, temp_dir=predictable_temp_dir, monitor_resources=True) as context:
         tempdir = context['temp_dir']
         resource_monitor = context['resource_monitor']
         requirements = context['requirements']
@@ -1048,6 +1223,11 @@ Phase 3.3 - Smart Metadata Extraction:
   python AudiobookMakerPy.py /path/to/files/ --cover art.png --chapter-titles filename
   python AudiobookMakerPy.py /path/to/files/ --quality high --cover cover.jpg
 
+Phase 3.4 - Resume Functionality:
+  python AudiobookMakerPy.py /path/to/files/ --resume auto  # Resume if possible (default)
+  python AudiobookMakerPy.py /path/to/files/ --resume never  # Always start fresh
+  python AudiobookMakerPy.py /path/to/files/ --resume force  # Fail if cannot resume
+
 Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         """
     )
@@ -1140,10 +1320,18 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         help='Chapter title source: auto (smart extraction), filename (use filenames), generic (Chapter 1, 2, etc.)'
     )
     
+    # Phase 3.4: Resume Functionality arguments
+    parser.add_argument(
+        '--resume',
+        choices=['auto', 'never', 'force'],
+        default='auto',
+        help='Resume behavior: auto (resume if possible), never (always start fresh), force (fail if cannot resume)'
+    )
+    
     parser.add_argument(
         '--version', '-v',
         action='version',
-        version='AudiobookMakerPy 2.0 (Phase 3.3)'
+        version='AudiobookMakerPy 2.0 (Phase 3.4)'
     )
     
     args = parser.parse_args()
@@ -1325,8 +1513,10 @@ def load_audio_segment(file_path):
 
 def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
     """
-    Converts an audio file to AAC format for concatenation.
-    Uses pydub if available, otherwise falls back to FFmpeg subprocess.
+    Converts an audio file to AAC format for concatenation with resume functionality.
+    
+    Phase 3.4: Idempotent conversion function that checks for existing converted files
+    and validates source file changes using receipt files to enable resume functionality.
     
     Args:
         input_file (str): Path to the input audio file.
@@ -1340,11 +1530,49 @@ def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
         ConversionError: If conversion fails.
     """
     try:
-        logging.info(f'Converting {input_file} for concatenation')
-        
         # Generate temporary file path
         base_name = os.path.splitext(os.path.basename(input_file))[0]
         temp_file = os.path.join(temp_dir, f"{base_name}_converted.m4a")
+        
+        # Phase 3.4: Check for existing conversion and validate receipt
+        if os.path.exists(temp_file):
+            if validate_receipt_file(input_file, temp_dir):
+                # File exists and source hasn't changed - resume by skipping conversion
+                try:
+                    if PYDUB_AVAILABLE:
+                        # Get duration from existing file using pydub
+                        audio = AudioSegment.from_file(temp_file)
+                        duration_ms = len(audio)
+                    else:
+                        # Get duration using FFprobe
+                        duration_ms = get_audio_duration_ms(temp_file)
+                    
+                    logging.info(f'Resuming: {input_file} already converted (duration: {duration_ms}ms)')
+                    return temp_file, duration_ms
+                    
+                except Exception as e:
+                    logging.warning(f'Failed to read existing converted file {temp_file}: {e}')
+                    # Remove corrupted file and receipt to force reconversion
+                    try:
+                        os.remove(temp_file)
+                        receipt_file = os.path.join(temp_dir, f"{base_name}.receipt")
+                        if os.path.exists(receipt_file):
+                            os.remove(receipt_file)
+                    except Exception:
+                        pass
+            else:
+                # Source file changed or no receipt - remove old conversion
+                logging.info(f'Source file changed: {input_file}, reconverting')
+                try:
+                    os.remove(temp_file)
+                    receipt_file = os.path.join(temp_dir, f"{base_name}.receipt") 
+                    if os.path.exists(receipt_file):
+                        os.remove(receipt_file)
+                except Exception as e:
+                    logging.warning(f'Failed to remove outdated conversion: {e}')
+        
+        # Perform conversion (either new or after validation failure)
+        logging.info(f'Converting {input_file} for concatenation')
         
         if PYDUB_AVAILABLE:
             # Use pydub if available
@@ -1356,6 +1584,9 @@ def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
                 parameters=["-ar", "44100", "-ac", "2"]
             )
             duration_ms = len(audio)
+            
+            # Phase 3.4: Create receipt file after successful pydub conversion
+            create_receipt_file(input_file, temp_dir)
         else:
             # Fallback to FFmpeg subprocess (original method)
             ffmpeg_command = [
@@ -1366,6 +1597,9 @@ def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
             
             # Get duration using ffprobe
             duration_ms = get_audio_duration_fallback(input_file)
+        
+        # Phase 3.4: Create receipt file after successful conversion
+        create_receipt_file(input_file, temp_dir)
         
         logging.info(f'Converted {input_file} to {temp_file}, duration: {duration_ms}ms')
         return temp_file, duration_ms
@@ -1514,7 +1748,7 @@ if __name__ == '__main__':
     # Setup logging with quiet mode support
     setup_logging(quiet=args.quiet)
     
-    print("AudiobookMakerPy v2.0 - Phase 3.3 (Smart Metadata Extraction)")
+    print("AudiobookMakerPy v2.0 - Phase 3.4 (Resume Functionality)")
     print("=" * 50)
     
     # Initialize progress tracking and timer
@@ -1638,7 +1872,8 @@ if __name__ == '__main__':
             output_file, 
             bitrate=args.bitrate,
             cores=args.cores,
-            progress_tracker=progress_tracker
+            progress_tracker=progress_tracker,
+            resume_mode=args.resume
         )
         
         # Collect any processing errors
