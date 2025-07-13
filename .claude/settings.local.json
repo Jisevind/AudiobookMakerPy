@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(powershell:*)"
+    ],
+    "deny": []
+  },
+  "git": {
+    "includeClaudeCodeCredit": false
+  }
+}
