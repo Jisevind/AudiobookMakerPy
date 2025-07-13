@@ -26,6 +26,31 @@ import re
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
+# Audio processing imports
+try:
+    # Import mutagen (always works)
+    from mutagen.mp4 import MP4
+    MUTAGEN_AVAILABLE = True
+except ImportError:
+    MUTAGEN_AVAILABLE = False
+    print("Warning: mutagen not available. Install with: pip install mutagen")
+
+# Try to import pydub, but continue without it if it fails (Python 3.13 compatibility)
+try:
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+    logging.info('pydub available - using for audio processing')
+except ImportError:
+    PYDUB_AVAILABLE = False
+    logging.info('pydub not available - using fallback subprocess method')
+    
+if not MUTAGEN_AVAILABLE:
+    print("ERROR: mutagen is required. Please install with: pip install -r requirements.txt")
+    sys.exit(1)
+
 # Global variables
 max_cpu_cores = os.cpu_count()  # Number of cores to use for parallel processing, use all available cores by default
 tempdir = None
@@ -234,50 +259,71 @@ def copy_metadata(input_file, output_file):
         raise MetadataError(f"Copying metadata from {input_file} to {output_file} failed.") from e
 
 def process_audio_files(input_files, output_file):
-    """Processes audio files, converts them to AAC, creates metadata, and concatenates the files.
+    """Processes audio files using pydub, converts and concatenates them.
 
     Args:
         input_files (list): List of paths to input audio files.
         output_file (str): Path to output audio file.
 
     Returns:
-        str: Path to the temporary directory used for conversion.
+        list: List of durations in milliseconds for each input file.
     """
     global tempdir
 
-    durations = []
-    audio_properties = []
-    
-    for f in input_files:
-        duration = get_audio_duration(f)
-        properties = get_audio_properties(f)
-
-        durations.append(duration)
-        audio_properties.append(properties)
-
     tempdir = tempfile.mkdtemp()
-
+    converted_files = []
+    durations = []
+    
     try:
         with ProcessPoolExecutor(max_workers=max_cpu_cores) as executor:
             # Log the start of the conversion process
-            logging.info(f'Converting {len(input_files)} files to AAC')
+            logging.info(f'Converting {len(input_files)} files using pydub')
             # Define a list of future tasks for conversion
-            future_tasks = [executor.submit(convert_to_aac, input_file, os.path.join(tempdir, os.path.splitext(os.path.basename(input_file))[0] + '_converted.m4a'), properties['bit_rate'] // 1000)
-                            for input_file, properties in zip(input_files, audio_properties)]
-            # Update the input files with the results of the tasks
-            input_files = [future.result() for future in future_tasks]
+            future_tasks = [executor.submit(convert_file_for_concatenation, input_file, tempdir)
+                            for input_file in input_files]
+            
+            # Collect results (temp file paths and durations)
+            for future in future_tasks:
+                temp_file_path, duration_ms = future.result()
+                converted_files.append(temp_file_path)
+                durations.append(duration_ms)
 
-        logging.info('Creating metadata file')
-        metadata_file = create_metadata_file(tempdir, input_files, durations)
+        # Concatenate files - use pydub if available, otherwise use FFmpeg
+        if PYDUB_AVAILABLE:
+            logging.info(f'Concatenating {len(converted_files)} files using pydub')
+            final_audio = AudioSegment.empty()
+            
+            for temp_file in converted_files:
+                audio_segment = AudioSegment.from_file(temp_file)
+                final_audio += audio_segment
+                
+            # Export the final concatenated audio to M4B format
+            logging.info(f'Exporting final audiobook to {output_file}')
+            final_audio.export(
+                output_file,
+                format="ipod",  # M4B compatible format
+                bitrate="128k",
+                parameters=["-ar", "44100", "-ac", "2"]
+            )
+        else:
+            # Fallback: Use FFmpeg concat demuxer
+            logging.info(f'Concatenating {len(converted_files)} files using FFmpeg')
+            concat_file = os.path.join(tempdir, 'concat_list.txt')
+            with open(concat_file, 'w') as f:
+                for temp_file in converted_files:
+                    f.write(f"file '{temp_file}'\n")
+            
+            ffmpeg_concat_command = [
+                'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+                '-c', 'copy', output_file
+            ]
+            subprocess.run(ffmpeg_concat_command, check=True)
+        
+        return durations
 
-        logging.info(f'Concatenating {len(input_files)} files')
-        mp4box_concat_command = ['MP4Box', '-force-cat', '-chap', metadata_file] + [arg for f in input_files for arg in ['-cat', f]] + [output_file]
-        subprocess.run(mp4box_concat_command, check=True)
-
-    except ConversionError as e:
-        logging.error(f'A conversion error occurred: {str(e)}')
-        shutil.rmtree(tempdir)
-        sys.exit(1)
+    except (ConversionError, Exception) as e:
+        logging.error(f'An error occurred during processing: {str(e)}')
+        return None
 
 def setup_logging():
     """
@@ -368,6 +414,110 @@ def get_output_file(input_files):
     output_name = os.path.basename(folder_path) + '.m4b'
     return os.path.join(folder_path, output_name)
 
+def check_ffmpeg_dependency():
+    """
+    Checks if FFmpeg is available and accessible.
+    
+    Raises:
+        SystemExit: If FFmpeg is not found or not accessible.
+    """
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        logging.info('FFmpeg dependency check passed')
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("ERROR: FFmpeg is required but not found.")
+        print("Please install FFmpeg and ensure it's in your system PATH.")
+        print("Download from: https://ffmpeg.org/")
+        logging.error('FFmpeg dependency check failed - FFmpeg not found or not accessible')
+        sys.exit(1)
+
+def load_audio_segment(file_path):
+    """
+    Loads an audio file using pydub and returns an AudioSegment object.
+    
+    Args:
+        file_path (str): Path to the audio file.
+        
+    Returns:
+        AudioSegment: The loaded audio segment.
+        
+    Raises:
+        AudioPropertiesError: If the file cannot be loaded.
+    """
+    try:
+        logging.info(f'Loading audio segment for {file_path}')
+        audio_segment = AudioSegment.from_file(file_path)
+        return audio_segment
+    except Exception as e:
+        logging.error(f'Error loading audio file {file_path}: {str(e)}')
+        raise AudioPropertiesError(f"Loading audio file {file_path} failed.") from e
+
+def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
+    """
+    Converts an audio file to AAC format for concatenation.
+    Uses pydub if available, otherwise falls back to FFmpeg subprocess.
+    
+    Args:
+        input_file (str): Path to the input audio file.
+        temp_dir (str): Directory for temporary files.
+        bitrate (str): Output bitrate (default: 128k).
+        
+    Returns:
+        tuple: (temp_file_path, duration_in_ms)
+        
+    Raises:
+        ConversionError: If conversion fails.
+    """
+    try:
+        logging.info(f'Converting {input_file} for concatenation')
+        
+        # Generate temporary file path
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        temp_file = os.path.join(temp_dir, f"{base_name}_converted.m4a")
+        
+        if PYDUB_AVAILABLE:
+            # Use pydub if available
+            audio = AudioSegment.from_file(input_file)
+            audio.export(
+                temp_file, 
+                format="ipod",  # M4A/M4B compatible format
+                bitrate=bitrate,
+                parameters=["-ar", "44100", "-ac", "2"]
+            )
+            duration_ms = len(audio)
+        else:
+            # Fallback to FFmpeg subprocess (original method)
+            ffmpeg_command = [
+                'ffmpeg', '-i', input_file, '-vn', '-acodec', 'aac', 
+                '-b:a', f'{bitrate}', '-ar', '44100', '-ac', '2', temp_file
+            ]
+            subprocess.run(ffmpeg_command, check=True)
+            
+            # Get duration using ffprobe
+            duration_ms = get_audio_duration_fallback(input_file)
+        
+        logging.info(f'Converted {input_file} to {temp_file}, duration: {duration_ms}ms')
+        return temp_file, duration_ms
+        
+    except Exception as e:
+        logging.error(f'Error converting {input_file}: {str(e)}')
+        raise ConversionError(f"Conversion of {input_file} failed.") from e
+
+def get_audio_duration_fallback(input_file):
+    """
+    Fallback method to get audio duration using ffprobe.
+    """
+    ffprobe_command = [
+        'ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+        '-of', 'default=noprint_wrappers=1:nokey=1', input_file
+    ]
+    try:
+        output = subprocess.check_output(ffprobe_command).decode('utf-8').strip()
+        return int(float(output) * 1000)  # convert to milliseconds
+    except subprocess.CalledProcessError as e:
+        logging.error(f'Error getting duration for {input_file}: {str(e)}')
+        raise AudioDurationError(f"Getting duration of {input_file} failed.") from e
+
 def cleanup_tempdir():
     """
     Removes the temporary directory used during audiobook creation process.
@@ -385,14 +535,22 @@ def cleanup_tempdir():
 
 if __name__ == '__main__':
     setup_logging()
+    
+    # Check dependencies first
+    check_ffmpeg_dependency()
 
     input_paths = parse_arguments()
     input_files = validate_and_get_input_files(input_paths)
     output_file = get_output_file(input_files)
 
-    process_audio_files(input_files, output_file)
+    # Process files and get durations (no longer using MP4Box)
+    file_durations = process_audio_files(input_files, output_file)
+    
+    # Copy metadata from first input file to output
     copy_metadata(input_files[0], output_file)
 
     cleanup_tempdir()
+    
+    logging.info('Audiobook creation complete.')
 
     logging.info('Audiobook creation complete.')
