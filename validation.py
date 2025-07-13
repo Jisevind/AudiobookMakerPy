@@ -170,9 +170,13 @@ class AudioFileValidator:
                 warnings=warnings
             )
     
-    def validate_batch(self, file_paths: List[str]) -> Tuple[List[ValidationResult], List[str]]:
+    def validate_batch(self, file_paths: List[str], progress_callback=None) -> Tuple[List[ValidationResult], List[str]]:
         """
         Validate multiple files in batch for fail-fast feedback.
+        
+        Args:
+            file_paths: List of file paths to validate
+            progress_callback: Optional callback for progress updates (called with each file)
         
         Returns:
             Tuple of (all_results, valid_file_paths)
@@ -182,7 +186,7 @@ class AudioFileValidator:
         results = []
         valid_files = []
         
-        for file_path in file_paths:
+        for i, file_path in enumerate(file_paths):
             result = self.validate_file(file_path)
             results.append(result)
             
@@ -190,6 +194,10 @@ class AudioFileValidator:
                 valid_files.append(file_path)
             else:
                 self.logger.warning(f"Validation failed for {file_path}: {len(result.errors)} errors")
+            
+            # Call progress callback if provided
+            if progress_callback:
+                progress_callback(i + 1, file_path, result.is_valid)
         
         self.logger.info(f"Batch validation complete: {len(valid_files)}/{len(file_paths)} files valid")
         return results, valid_files
@@ -450,15 +458,20 @@ class ValidationSummary:
 
 
 # Convenience functions for common validation scenarios
-def validate_audio_files(file_paths: List[str], validation_level: ValidationLevel = ValidationLevel.NORMAL) -> Tuple[List[str], str]:
+def validate_audio_files(file_paths: List[str], validation_level: ValidationLevel = ValidationLevel.NORMAL, progress_callback=None) -> Tuple[List[str], str]:
     """
     Validate a list of audio files and return valid files with a report.
+    
+    Args:
+        file_paths: List of file paths to validate
+        validation_level: Validation strictness level
+        progress_callback: Optional callback for progress updates
     
     Returns:
         Tuple of (valid_file_paths, validation_report)
     """
     validator = AudioFileValidator(validation_level)
-    results, valid_files = validator.validate_batch(file_paths)
+    results, valid_files = validator.validate_batch(file_paths, progress_callback)
     report = ValidationSummary.generate_report(results)
     
     return valid_files, report

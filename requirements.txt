@@ -7,3 +7,6 @@ pydub>=0.25.1
 
 # Audio metadata handling
 mutagen>=1.47.0
+
+# Progress indicators and user experience
+tqdm>=4.65.0

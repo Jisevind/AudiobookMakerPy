@@ -24,6 +24,9 @@ from resource_manager import (
     managed_processing, managed_temp_directory, 
     get_signal_handler, get_timeout_manager
 )
+from progress_tracker import (
+    create_progress_tracker, ProcessingTimer, format_file_status
+)
 
 # Audio processing imports
 try:
@@ -376,7 +379,7 @@ def _add_chapters_to_file(audiofile, chapters):
         logging.warning(f'Could not add chapters to file: {str(e)}')
         # Continue without chapters rather than failing completely
 
-def process_audio_files(input_files, output_file, bitrate="128k", cores=None):
+def process_audio_files(input_files, output_file, bitrate="128k", cores=None, progress_tracker=None):
     """Processes audio files with comprehensive resource management.
 
     This function implements Phase 2.4 resource management including:
@@ -412,53 +415,81 @@ def process_audio_files(input_files, output_file, bitrate="128k", cores=None):
         signal_handler.add_cleanup_callback(lambda: cleanup_temp_files(tempdir))
         
         try:
-            print(f"\nConverting {len(input_files)} audio files...")
-            print(f"Using temporary directory: {tempdir}")
-            print(f"Using {cores_to_use} CPU cores")
-            print(f"Estimated memory usage: {requirements['estimated_memory_mb']}MB")
-            print(f"Estimated temp space: {requirements['estimated_temp_space_mb']}MB")
+            if not progress_tracker:
+                print(f"\nConverting {len(input_files)} audio files...")
+                print(f"Using temporary directory: {tempdir}")
+                print(f"Using {cores_to_use} CPU cores")
+                print(f"Estimated memory usage: {requirements['estimated_memory_mb']}MB")
+                print(f"Estimated temp space: {requirements['estimated_temp_space_mb']}MB")
             
-            with ProcessPoolExecutor(max_workers=cores_to_use) as executor:
-                # Create tasks with error handling
-                future_to_file = {
-                    executor.submit(convert_file_for_concatenation, input_file, tempdir, bitrate): input_file
-                    for input_file in input_files
-                }
-                
-                # Collect results with skip-and-continue logic
-                completed = 0
-                successful = 0
-                for future in future_to_file:
-                    input_file = future_to_file[future]
+            # Use progress tracking for conversion
+            if progress_tracker:
+                conversion_context = progress_tracker.conversion_progress(len(input_files))
+            else:
+                from contextlib import nullcontext
+                conversion_context = nullcontext()
+            
+            with conversion_context as conversion_progress:
+                with ProcessPoolExecutor(max_workers=cores_to_use) as executor:
+                    # Create tasks with error handling
+                    future_to_file = {
+                        executor.submit(convert_file_for_concatenation, input_file, tempdir, bitrate): input_file
+                        for input_file in input_files
+                    }
                     
-                    # Check for shutdown signal
-                    if signal_handler.check_shutdown_requested():
-                        print("\nShutdown requested, cancelling remaining tasks...")
-                        break
-                    
-                    # Check memory usage periodically
-                    if completed % 5 == 0:  # Check every 5 files
-                        resource_monitor.check_memory_limit()
-                    
-                    try:
-                        temp_file_path, duration_ms = future.result()
-                        converted_files.append(temp_file_path)
-                        durations.append(duration_ms)
-                        successful += 1
-                        print(f"[OK] Converted {os.path.basename(input_file)}")
-                    except FileProcessingError as e:
-                        processing_errors.append(e)
-                        print(f"[FAIL] Failed to convert {os.path.basename(input_file)}: {e}")
-                        logging.warning(f"Skipping file due to conversion error: {e}")
-                    except Exception as e:
-                        # Wrap unexpected errors
-                        wrapped_error = ProcessingError(f"Unexpected error: {str(e)}", "conversion", recoverable=False)
-                        processing_errors.append(wrapped_error)
-                        print(f"[ERROR] Unexpected error with {os.path.basename(input_file)}: {e}")
-                        logging.error(f"Unexpected error during conversion: {e}")
-                    
-                    completed += 1
-                    print(f"Progress: {completed}/{len(input_files)} files processed ({successful} successful)")
+                    # Collect results with skip-and-continue logic
+                    completed = 0
+                    successful = 0
+                    for future in future_to_file:
+                        input_file = future_to_file[future]
+                        
+                        # Check for shutdown signal
+                        if signal_handler.check_shutdown_requested():
+                            if progress_tracker:
+                                conversion_progress.set_description("Shutdown requested - cancelling...")
+                            else:
+                                print("\nShutdown requested, cancelling remaining tasks...")
+                            break
+                        
+                        # Check memory usage periodically
+                        if completed % 5 == 0:  # Check every 5 files
+                            resource_monitor.check_memory_limit()
+                        
+                        try:
+                            temp_file_path, duration_ms = future.result()
+                            converted_files.append(temp_file_path)
+                            durations.append(duration_ms)
+                            successful += 1
+                            
+                            if progress_tracker:
+                                status_msg = format_file_status(input_file, "OK")
+                                conversion_progress.update(1, status_msg)
+                            else:
+                                print(f"[OK] Converted {os.path.basename(input_file)}")
+                                
+                        except FileProcessingError as e:
+                            processing_errors.append(e)
+                            if progress_tracker:
+                                status_msg = format_file_status(input_file, "FAIL")
+                                conversion_progress.update(1, status_msg)
+                            else:
+                                print(f"[FAIL] Failed to convert {os.path.basename(input_file)}: {e}")
+                            logging.warning(f"Skipping file due to conversion error: {e}")
+                            
+                        except Exception as e:
+                            # Wrap unexpected errors
+                            wrapped_error = ProcessingError(f"Unexpected error: {str(e)}", "conversion", recoverable=False)
+                            processing_errors.append(wrapped_error)
+                            if progress_tracker:
+                                status_msg = format_file_status(input_file, "ERROR")
+                                conversion_progress.update(1, status_msg)
+                            else:
+                                print(f"[ERROR] Unexpected error with {os.path.basename(input_file)}: {e}")
+                            logging.error(f"Unexpected error during conversion: {e}")
+                        
+                        completed += 1
+                        if not progress_tracker:
+                            print(f"Progress: {completed}/{len(input_files)} files processed ({successful} successful)")
 
             # Only proceed with concatenation if we have some successful conversions
             if not converted_files:
@@ -467,13 +498,24 @@ def process_audio_files(input_files, output_file, bitrate="128k", cores=None):
                 print(f"\nWarning: Only {len(converted_files)}/{len(input_files)} files converted successfully")
                 print("Proceeding with available files...")
 
-            print(f"\nConcatenating {len(converted_files)} files into audiobook...")
-            try:
-                _concatenate_audio_files(converted_files, output_file, tempdir)
-                print(f"Successfully created: {output_file}")
-            except ConcatenationError as e:
-                processing_errors.append(e)
-                raise  # Re-raise concatenation errors as they're fatal
+            # Step 3: Concatenation and metadata
+            if progress_tracker:
+                with progress_tracker.operation_progress("Concatenating files", show_spinner=True) as concat_progress:
+                    try:
+                        concat_progress.update_status("Merging audio streams")
+                        _concatenate_audio_files(converted_files, output_file, tempdir)
+                        concat_progress.complete("Audio concatenation complete")
+                    except ConcatenationError as e:
+                        processing_errors.append(e)
+                        raise
+            else:
+                print(f"\nConcatenating {len(converted_files)} files into audiobook...")
+                try:
+                    _concatenate_audio_files(converted_files, output_file, tempdir)
+                    print(f"Successfully created: {output_file}")
+                except ConcatenationError as e:
+                    processing_errors.append(e)
+                    raise  # Re-raise concatenation errors as they're fatal
             
             return durations, processing_errors
         
@@ -600,7 +642,7 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
     parser.add_argument(
         '--version', '-v',
         action='version',
-        version='AudiobookMakerPy 2.0 (Phase 2.4)'
+        version='AudiobookMakerPy 2.0 (Phase 3.1)'
     )
     
     args = parser.parse_args()
@@ -942,18 +984,36 @@ if __name__ == '__main__':
     # Setup logging with quiet mode support
     setup_logging(quiet=args.quiet)
     
-    print("AudiobookMakerPy v2.0 - Phase 2.4 (Resource Management)")
+    print("AudiobookMakerPy v2.0 - Phase 3.1 (Progress Indicators)")
     print("=" * 50)
+    
+    # Initialize progress tracking and timer
+    progress_tracker = create_progress_tracker(quiet=args.quiet)
+    processing_timer = ProcessingTimer()
+    processing_timer.start()
     
     # Validate and collect input files
     input_files = validate_and_get_input_files(args.input_paths)
     
-    # Pre-flight validation as suggested by Gemini's pydub insights
-    print(f"\nPerforming pre-flight validation ({args.validation_level} mode)...")
+    # Pre-flight validation with progress tracking
     validation_level = ValidationLevel(args.validation_level)
     
     try:
-        valid_files, validation_report = validate_audio_files(input_files, validation_level)
+        # Step 1: Validation with progress bar
+        progress_tracker.print_step("Pre-flight validation", 1, 3)
+        
+        def validation_progress_callback(current, file_path, is_valid):
+            status = "✓" if is_valid else "✗"
+            return format_file_status(file_path, status)
+        
+        with progress_tracker.validation_progress(len(input_files)) as validation_progress:
+            def progress_update(current, file_path, is_valid):
+                description = validation_progress_callback(current, file_path, is_valid)
+                validation_progress.update(1, description)
+            
+            valid_files, validation_report = validate_audio_files(
+                input_files, validation_level, progress_update
+            )
         
         if len(valid_files) != len(input_files):
             print("\n" + "=" * 50)
@@ -974,9 +1034,8 @@ if __name__ == '__main__':
             
             # Update input_files to only include valid files
             input_files = valid_files
-            
         else:
-            print(f"[OK] All {len(input_files)} files passed validation")
+            progress_tracker.print_step("All files passed validation ✓", 1, 3)
             
     except Exception as e:
         print(f"[ERROR] Pre-flight validation failed: {str(e)}")
@@ -999,17 +1058,18 @@ if __name__ == '__main__':
     
     try:
         # Check dependencies first
-        print("Checking dependencies...")
+        progress_tracker.print_step("Checking dependencies", 2, 3)
         ffmpeg_version = check_ffmpeg_dependency()
-        print("FFmpeg dependency check passed")
         logging.info(f'FFmpeg version: {ffmpeg_version}')
         
         # Process files and get durations
+        progress_tracker.print_step("Processing audio files", 3, 3)
         file_durations, processing_errors = process_audio_files(
             input_files, 
             output_file, 
             bitrate=args.bitrate,
-            cores=args.cores
+            cores=args.cores,
+            progress_tracker=progress_tracker
         )
         
         # Collect any processing errors
@@ -1021,31 +1081,58 @@ if __name__ == '__main__':
             sys.exit(1)
         
         # Add comprehensive metadata using mutagen
-        print(f"\nAdding metadata and chapters...")
-        try:
-            add_metadata_to_audiobook(
-                output_file, 
-                input_files, 
-                file_durations,
-                title=args.title,
-                author=args.author
-            )
-        except MetadataError as e:
-            all_errors.append(e)
-            print(f"Warning: Metadata processing failed: {e}")
-            logging.warning(f"Metadata processing failed but audiobook was created: {e}")
+        if not args.quiet:
+            with progress_tracker.operation_progress("Writing metadata", show_spinner=True) as metadata_progress:
+                try:
+                    metadata_progress.update_status("Adding chapter information")
+                    add_metadata_to_audiobook(
+                        output_file, 
+                        input_files, 
+                        file_durations,
+                        title=args.title,
+                        author=args.author
+                    )
+                    metadata_progress.complete("Metadata written successfully")
+                except MetadataError as e:
+                    all_errors.append(e)
+                    metadata_progress.complete("Metadata processing failed")
+                    print(f"Warning: Metadata processing failed: {e}")
+                    logging.warning(f"Metadata processing failed but audiobook was created: {e}")
+        else:
+            try:
+                add_metadata_to_audiobook(
+                    output_file, 
+                    input_files, 
+                    file_durations,
+                    title=args.title,
+                    author=args.author
+                )
+            except MetadataError as e:
+                all_errors.append(e)
+                logging.warning(f"Metadata processing failed but audiobook was created: {e}")
         
         # Calculate total duration for summary
         total_duration_ms = sum(file_durations)
         total_hours = total_duration_ms // (1000 * 60 * 60)
         total_minutes = (total_duration_ms % (1000 * 60 * 60)) // (1000 * 60)
         
-        print(f"\nAudiobook creation complete!")
-        print(f"Summary:")
-        print(f"   - Files processed: {len(file_durations)}/{len(input_files)}")
-        print(f"   - Total duration: {total_hours}h {total_minutes}m")
-        print(f"   - Output: {output_file}")
-        print(f"   - Bitrate: {args.bitrate}")
+        # Final processing summary
+        processing_duration = processing_timer.stop()
+        successful_files = len(file_durations)
+        failed_files = len(input_files) - successful_files
+        
+        progress_tracker.print_summary(
+            total_files=len(input_files),
+            successful_files=successful_files,
+            failed_files=failed_files,
+            duration_seconds=processing_duration
+        )
+        
+        if not args.quiet:
+            print(f"\nAudiobook Details:")
+            print(f"   - Total duration: {total_hours}h {total_minutes}m")
+            print(f"   - Output: {output_file}")
+            print(f"   - Bitrate: {args.bitrate}")
         
         # Display error summary if there were any issues
         if all_errors:
