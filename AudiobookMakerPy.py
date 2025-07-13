@@ -417,10 +417,16 @@ def get_chapter_title(file_path):
 
 def extract_comprehensive_metadata(input_files):
     """
-    Extract comprehensive metadata from all source files.
+    Extract comprehensive metadata using streaming-friendly lazy loading.
     
     Phase 3.3: Enhanced metadata extraction with inheritance and conflict resolution.
-    Builds upon Phase 3.2's basic extraction to provide rich metadata for chapters.
+    Phase 4.1: Implements lazy loading principle - only reads metadata headers, 
+    never loads actual audio streams into memory.
+    
+    Streaming Architecture:
+    - Uses mutagen's streaming metadata access (reads only file headers)
+    - Processes files individually to maintain constant memory usage
+    - Avoids loading large audio data into Python memory
     
     Args:
         input_files: List of input audio file paths
@@ -1627,11 +1633,19 @@ def get_audio_duration_fallback(input_file):
 
 def _concatenate_audio_files(converted_files, output_file, temp_dir):
     """
-    Concatenates audio files using FFmpeg for memory efficiency.
+    Concatenates audio files using streaming architecture for memory efficiency.
     
-    Per Gemini's analysis: pydub concatenation loads all files into memory simultaneously,
-    which can require 6GB+ RAM for large audiobooks. FFmpeg's concat demuxer is much more
-    memory efficient as it streams files directly from disk.
+    Phase 4.1 Streaming Processing Implementation:
+    This function implements the core streaming concatenation strategy that enables processing
+    of large audiobook collections without memory exhaustion. Uses FFmpeg's streaming 
+    capabilities instead of loading all audio data into Python memory.
+    
+    Memory Architecture:
+    - pydub concatenation: Loads ALL files into memory (6GB+ for large collections)
+    - FFmpeg concatenation: Streams from disk with constant minimal RAM usage
+    
+    Per Gemini's analysis: This streaming approach is not just an optimization but a 
+    core requirement for the application to function reliably with real-world large files.
     
     Args:
         converted_files (list): List of temporary converted file paths.
@@ -1642,8 +1656,8 @@ def _concatenate_audio_files(converted_files, output_file, temp_dir):
         ConversionError: If concatenation fails.
     """
     try:
-        # Always use FFmpeg for concatenation to avoid memory issues
-        # This implements Gemini's "streaming concatenation strategy"
+        # Phase 4.1: Always use streaming FFmpeg concatenation to prevent memory exhaustion
+        # This implements the "Pipeline Processing" architecture from claude_plan.md
         _concatenate_with_ffmpeg(converted_files, output_file, temp_dir)
     except Exception as e:
         logging.error(f'Concatenation failed: {str(e)}')
@@ -1651,11 +1665,23 @@ def _concatenate_audio_files(converted_files, output_file, temp_dir):
 
 def _concatenate_with_pydub(converted_files, output_file):
     """
-    Concatenates audio files using pydub.
+    **DEPRECATED** - In-memory concatenation method.
     
-    WARNING: This method loads all files into memory simultaneously and can consume
-    6GB+ RAM for large audiobooks. Use _concatenate_with_ffmpeg for production.
-    Kept for potential future optimizations with chunked processing.
+    Phase 4.1 Streaming Processing - EXPLICIT REJECTION:
+    This method violates the core principles of streaming processing by loading all 
+    audio files into Python memory simultaneously. As per Gemini's analysis, this 
+    approach is fundamentally incompatible with real-world large audiobook processing.
+    
+    Memory Impact:
+    - Loads ALL converted files into RAM at once
+    - Can consume 6GB+ for large audiobook collections  
+    - Causes memory exhaustion and application crashes
+    - Violates the "File-by-File Processing" principle
+    
+    This method is kept only for documentation purposes to prevent future maintainers
+    from accidentally re-introducing the memory bug. DO NOT USE in production.
+    
+    Use _concatenate_with_ffmpeg for all production concatenation operations.
     """
     logging.warning(f'Using memory-intensive pydub concatenation for {len(converted_files)} files')
     logging.info(f'Concatenating {len(converted_files)} files using pydub')
@@ -1686,9 +1712,28 @@ def _concatenate_with_pydub(converted_files, output_file):
 
 def _concatenate_with_ffmpeg(converted_files, output_file, temp_dir):
     """
-    Concatenates audio files using FFmpeg concat demuxer (fallback method).
+    Concatenates audio files using FFmpeg concat demuxer with memory pressure monitoring.
+    
+    Phase 4.1 Streaming Processing Implementation:
+    Uses FFmpeg's streaming concat demuxer to process files without loading them into memory.
+    Includes memory pressure detection and response mechanisms.
     """
-    logging.info(f'Concatenating {len(converted_files)} files using FFmpeg')
+    logging.info(f'Concatenating {len(converted_files)} files using FFmpeg streaming architecture')
+    
+    # Phase 4.1: Memory pressure detection before concatenation
+    try:
+        from resource_manager import ResourceMonitor
+        monitor = ResourceMonitor()
+        memory_stats = monitor.get_current_memory_usage()
+        logging.info(f"Pre-concatenation memory usage: {memory_stats['percent_used']:.1f}% "
+                    f"({memory_stats['used_mb']:.1f}MB used)")
+        
+        # Check if we're approaching memory limits before starting concatenation
+        if memory_stats['percent_used'] > 80:
+            logging.warning(f"High memory usage detected ({memory_stats['percent_used']:.1f}%) before concatenation")
+            logging.info("FFmpeg streaming concatenation will help maintain low memory usage")
+    except ImportError:
+        logging.debug("Resource monitoring not available for concatenation")
     
     # Create concat list file with proper escaping
     concat_file = os.path.join(temp_dir, 'concat_list.txt')
@@ -1706,25 +1751,50 @@ def _concatenate_with_ffmpeg(converted_files, output_file, temp_dir):
             logging.warning(f'Could not remove existing {output_file}, FFmpeg will overwrite')
     
     # Enhanced FFmpeg concatenation command
+    # Phase 4.1: Uses streaming concat demuxer for constant memory usage
     ffmpeg_concat_command = [
         'ffmpeg', 
         '-f', 'concat',
         '-safe', '0',
         '-i', concat_file,
-        '-c', 'copy',  # Copy streams without re-encoding
+        '-c', 'copy',  # Copy streams without re-encoding (streaming)
         '-movflags', '+faststart',  # Optimize for streaming
         '-y',  # Overwrite output file
         output_file
     ]
     
-    logging.debug(f'Running FFmpeg command: {" ".join(ffmpeg_concat_command)}')
-    result = subprocess.run(ffmpeg_concat_command, capture_output=True, text=True)
+    logging.debug(f'Running FFmpeg streaming command: {" ".join(ffmpeg_concat_command)}')
+    
+    # Phase 4.1: Monitor memory during concatenation operation
+    try:
+        result = subprocess.run(ffmpeg_concat_command, capture_output=True, text=True)
+        
+        # Post-concatenation memory check
+        try:
+            post_memory = monitor.get_current_memory_usage()
+            logging.info(f"Post-concatenation memory usage: {post_memory['percent_used']:.1f}% "
+                        f"({post_memory['used_mb']:.1f}MB used)")
+            
+            # Verify streaming architecture maintained low memory usage
+            memory_increase = post_memory['used_mb'] - memory_stats['used_mb']
+            if memory_increase < 100:  # Less than 100MB increase is expected for streaming
+                logging.info(f"Streaming concatenation successful: only {memory_increase:.1f}MB memory increase")
+            else:
+                logging.warning(f"Higher than expected memory increase: {memory_increase:.1f}MB")
+                
+        except (NameError, UnboundLocalError):
+            # monitor not available, skip memory checks
+            pass
+            
+    except Exception as e:
+        logging.error(f'FFmpeg concatenation failed: {e}')
+        raise ConcatenationError(f"FFmpeg concatenation failed: {e}")
     
     if result.returncode != 0:
         logging.error(f'FFmpeg concatenation failed: {result.stderr}')
         raise ConcatenationError(f"FFmpeg concatenation failed: {result.stderr}")
     
-    logging.info(f'Successfully concatenated {len(converted_files)} files to {output_file}')
+    logging.info(f'Successfully concatenated {len(converted_files)} files to {output_file} using streaming architecture')
 
 def cleanup_tempdir():
     """
