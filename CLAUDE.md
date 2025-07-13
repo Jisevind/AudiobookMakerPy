@@ -67,3 +67,34 @@ No Python package dependencies are used - the script relies only on standard lib
 - Creates `.m4b` audiobook file in same directory as input
 - Generates timestamped log files: `logfile_YYYY-MM-DD_HH-MM-SS.log`
 - Uses temporary directory for intermediate files (auto-cleaned)
+
+## Test Files
+
+The repository includes 4 sets of test audio files in the `testfiles/` directory:
+
+1. **book1mp3/** - MP3 format test files
+   - 01 - Opening Credits & Introduction.mp3
+   - 02 - Chapter 1.mp3
+   - 03 - Chapter 2.mp3
+   - 04 - Chapter 3.mp3
+   - 05 - Chapter 4.mp3
+
+2. **book2mp3/** - MP3 format test files (different naming convention)
+   - 01 Intro Volume 1.mp3
+   - 02 The Book of Blood.mp3
+   - 03 The Midnight Meat Train.mp3
+   - 04 The Yattering and Jack.mp3
+
+3. **book3aac/** - AAC format test files
+   - 01-Intro Volume 1.aac
+   - 02-The Book of Blood.aac
+   - 03-The Midnight Meat Train.aac
+   - 04-The Yattering and Jack.aac
+
+4. **book4m4a/** - M4A format test files
+   - 1.Intro Volume 1.m4a
+   - 2.The Book of Blood.m4a
+   - 3.The Midnight Meat Train.m4a
+   - 4.The Yattering and Jack.m4a
+
+These test files can be used to validate functionality across different audio formats and naming conventions.

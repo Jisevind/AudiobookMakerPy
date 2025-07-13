@@ -65,6 +65,214 @@ def cleanup_temp_files(temp_directory):
         except Exception as e:
             logging.error(f"Failed emergency cleanup: {e}")
 
+def extract_metadata_for_template(input_files):
+    """
+    Extract metadata from source files for filename template generation.
+    
+    Phase 3.2: Uses mutagen to extract metadata from the first valid file
+    to provide template variables like {title}, {author}, {album}, {year}.
+    
+    Args:
+        input_files: List of input audio file paths
+        
+    Returns:
+        Dict containing metadata variables for template substitution
+    """
+    metadata = {
+        'title': 'Audiobook',
+        'author': 'Unknown Author', 
+        'album': 'Unknown Album',
+        'year': datetime.now().strftime('%Y'),
+        'date': datetime.now().strftime('%Y-%m-%d')
+    }
+    
+    if not MUTAGEN_AVAILABLE or not input_files:
+        return metadata
+    
+    # Try to extract metadata from the first file
+    try:
+        from mutagen import File
+        audio_file = File(input_files[0])
+        
+        if audio_file is not None:
+            # Common tag mappings across formats
+            title_tags = ['TIT2', 'TITLE', '\xa9nam']  # ID3, Vorbis, MP4
+            artist_tags = ['TPE1', 'ARTIST', '\xa9ART']  # ID3, Vorbis, MP4  
+            album_tags = ['TALB', 'ALBUM', '\xa9alb']    # ID3, Vorbis, MP4
+            date_tags = ['TDRC', 'DATE', '\xa9day']      # ID3, Vorbis, MP4
+            
+            # Extract title
+            for tag in title_tags:
+                if tag in audio_file and audio_file[tag]:
+                    metadata['title'] = str(audio_file[tag][0]).strip()
+                    break
+            
+            # Extract artist/author
+            for tag in artist_tags:
+                if tag in audio_file and audio_file[tag]:
+                    metadata['author'] = str(audio_file[tag][0]).strip()
+                    break
+                    
+            # Extract album
+            for tag in album_tags:
+                if tag in audio_file and audio_file[tag]:
+                    metadata['album'] = str(audio_file[tag][0]).strip()
+                    break
+                    
+            # Extract year
+            for tag in date_tags:
+                if tag in audio_file and audio_file[tag]:
+                    date_str = str(audio_file[tag][0]).strip()
+                    # Extract year from date string (handle various formats)
+                    import re
+                    year_match = re.search(r'\b(19|20)\d{2}\b', date_str)
+                    if year_match:
+                        metadata['year'] = year_match.group()
+                    break
+                    
+    except Exception as e:
+        logging.warning(f"Could not extract metadata from {input_files[0]}: {e}")
+    
+    return metadata
+
+def apply_filename_template(template, metadata, fallback_name="Audiobook"):
+    """
+    Apply filename template with metadata variable substitution.
+    
+    Phase 3.2: Simple template system using string replacement.
+    Supports variables: {title}, {author}, {album}, {year}, {date}
+    
+    Args:
+        template: Template string with {variable} placeholders
+        metadata: Dict containing metadata values 
+        fallback_name: Fallback name if template fails
+        
+    Returns:
+        Generated filename (without extension)
+    """
+    try:
+        # Sanitize metadata values for filename use
+        safe_metadata = {}
+        for key, value in metadata.items():
+            if value:
+                # Remove invalid filename characters
+                import re
+                safe_value = re.sub(r'[<>:"/\\|?*]', '', str(value))
+                safe_value = safe_value.strip()
+                safe_metadata[key] = safe_value if safe_value else f"Unknown {key.title()}"
+            else:
+                safe_metadata[key] = f"Unknown {key.title()}"
+        
+        # Apply template substitution
+        filename = template
+        for key, value in safe_metadata.items():
+            filename = filename.replace(f'{{{key}}}', value)
+        
+        # Remove any remaining template variables that weren't found
+        import re
+        filename = re.sub(r'\{[^}]*\}', '', filename)
+        filename = filename.strip()
+        
+        # Fallback if template resulted in empty string
+        if not filename or filename.isspace():
+            filename = fallback_name
+            
+        return filename
+        
+    except Exception as e:
+        logging.warning(f"Template application failed: {e}")
+        return fallback_name
+
+def validate_output_path(output_path):
+    """
+    Validate that the output path is writable and handle potential issues.
+    
+    Phase 3.2: Output validation and error handling
+    
+    Args:
+        output_path: Proposed output file path
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    try:
+        # Check if directory exists and is writable
+        output_dir = os.path.dirname(output_path)
+        if not os.path.exists(output_dir):
+            return False, f"Output directory does not exist: {output_dir}"
+            
+        if not os.access(output_dir, os.W_OK):
+            return False, f"Output directory is not writable: {output_dir}"
+            
+        # Check if filename is valid
+        filename = os.path.basename(output_path)
+        if not filename or filename.isspace():
+            return False, "Generated filename is empty"
+            
+        # Check for invalid filename characters (Windows)
+        import re
+        if re.search(r'[<>:"/\\|?*]', filename):
+            return False, f"Filename contains invalid characters: {filename}"
+            
+        # Check filename length (Windows limit is 255, be conservative)
+        if len(filename) > 200:
+            return False, f"Filename is too long ({len(filename)} characters): {filename}"
+            
+        return True, None
+        
+    except Exception as e:
+        return False, f"Output path validation error: {str(e)}"
+
+def determine_output_path(input_files, args, metadata):
+    """
+    Determine the final output file path based on user arguments and metadata.
+    
+    Phase 3.2: Combines output directory, naming template, and custom name options.
+    
+    Args:
+        input_files: List of input file paths
+        args: Parsed command line arguments
+        metadata: Extracted metadata for template variables
+        
+    Returns:
+        Complete output file path
+        
+    Raises:
+        ConfigurationError: If output path is invalid or cannot be created
+    """
+    # Determine output directory
+    if args.output_dir:
+        output_dir = os.path.abspath(args.output_dir)
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            raise ConfigurationError(f"Cannot create output directory '{output_dir}': {str(e)}")
+    else:
+        # Default: use directory of first input file
+        output_dir = os.path.dirname(os.path.abspath(input_files[0]))
+    
+    # Determine filename
+    if args.output_name:
+        # User provided explicit filename
+        filename = args.output_name
+        # Remove extension if user provided one (we'll add .m4b)
+        if filename.lower().endswith('.m4b'):
+            filename = filename[:-4]
+    else:
+        # Generate filename from template
+        filename = apply_filename_template(args.template, metadata)
+    
+    # Combine directory and filename with .m4b extension
+    output_path = os.path.join(output_dir, f"{filename}.m4b")
+    
+    # Validate the output path
+    is_valid, error_msg = validate_output_path(output_path)
+    if not is_valid:
+        raise ConfigurationError(f"Invalid output path: {error_msg}")
+    
+    return output_path
+
 def atoi(text):
     """Converts a digit string to an integer, otherwise returns the original string"""
     return int(text) if text.isdigit() else text
@@ -587,6 +795,12 @@ Examples:
   python AudiobookMakerPy.py /path/to/files/ --title "My Book" --author "Author Name"
   python AudiobookMakerPy.py /path/to/files/ --output /custom/path/output.m4b
   python AudiobookMakerPy.py /path/to/files/ --bitrate 64k --cores 2
+  
+Phase 3.2 - Flexible Output Control:
+  python AudiobookMakerPy.py /path/to/files/ --output-dir /custom/output/
+  python AudiobookMakerPy.py /path/to/files/ --output-name "My Custom Book"
+  python AudiobookMakerPy.py /path/to/files/ --quality high --template "{author} - {title}"
+  python AudiobookMakerPy.py /path/to/files/ --template "{author} - {album} ({year})"
 
 Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         """
@@ -639,13 +853,51 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         help='Validation strictness level (default: normal)'
     )
     
+    # Phase 3.2: Flexible Output Control arguments
+    parser.add_argument(
+        '--output-dir', '--dir',
+        type=str,
+        help='Output directory for generated audiobook (default: input directory)'
+    )
+    
+    parser.add_argument(
+        '--output-name', '--name',
+        type=str,
+        help='Custom filename for output audiobook (default: auto-generated from metadata)'
+    )
+    
+    parser.add_argument(
+        '--quality', '--qual',
+        choices=['low', 'medium', 'high', 'custom'],
+        default='medium',
+        help='Audio quality preset: low (96k), medium (128k), high (192k), custom (use --bitrate)'
+    )
+    
+    parser.add_argument(
+        '--template', '--tmpl',
+        type=str,
+        default='{title}',
+        help='Filename template using metadata variables: {title}, {author}, {album}, {year} (default: {title})'
+    )
+    
     parser.add_argument(
         '--version', '-v',
         action='version',
-        version='AudiobookMakerPy 2.0 (Phase 3.1)'
+        version='AudiobookMakerPy 2.0 (Phase 3.2)'
     )
     
     args = parser.parse_args()
+    
+    # Phase 3.2: Process quality presets
+    quality_presets = {
+        'low': '96k',
+        'medium': '128k', 
+        'high': '192k'
+    }
+    
+    # Apply quality preset to bitrate if not using custom
+    if args.quality != 'custom':
+        args.bitrate = quality_presets[args.quality]
     
     # Validate input paths exist
     for path in args.input_paths:
@@ -984,7 +1236,7 @@ if __name__ == '__main__':
     # Setup logging with quiet mode support
     setup_logging(quiet=args.quiet)
     
-    print("AudiobookMakerPy v2.0 - Phase 3.1 (Progress Indicators)")
+    print("AudiobookMakerPy v2.0 - Phase 3.2 (Flexible Output Control)")
     print("=" * 50)
     
     # Initialize progress tracking and timer
@@ -1003,7 +1255,7 @@ if __name__ == '__main__':
         progress_tracker.print_step("Pre-flight validation", 1, 3)
         
         def validation_progress_callback(current, file_path, is_valid):
-            status = "✓" if is_valid else "✗"
+            status = "OK" if is_valid else "FAIL"
             return format_file_status(file_path, status)
         
         with progress_tracker.validation_progress(len(input_files)) as validation_progress:
@@ -1035,16 +1287,40 @@ if __name__ == '__main__':
             # Update input_files to only include valid files
             input_files = valid_files
         else:
-            progress_tracker.print_step("All files passed validation ✓", 1, 3)
+            progress_tracker.print_step("All files passed validation - OK", 1, 3)
             
     except Exception as e:
         print(f"[ERROR] Pre-flight validation failed: {str(e)}")
         logging.error(f"Validation error: {str(e)}")
         sys.exit(1)
     
-    # Determine output file
-    output_file = get_output_file(input_files, args.output)
-    print(f"Output file: {output_file}")
+    # Phase 3.2: Extract metadata for template system
+    print("\nExtracting metadata for output naming...")
+    try:
+        metadata = extract_metadata_for_template(input_files)
+        
+        # Show extracted metadata if not quiet
+        if not args.quiet and metadata:
+            print(f"Detected metadata - Title: {metadata.get('title', 'N/A')}, Author: {metadata.get('author', 'N/A')}")
+        
+        # Phase 3.2: Determine output file with flexible control
+        output_file = determine_output_path(input_files, args, metadata)
+        
+        # Show user the planned output
+        print(f"Output file: {output_file}")
+        if args.quality != 'custom':
+            print(f"Audio quality: {args.quality} ({args.bitrate})")
+        else:
+            print(f"Audio quality: custom ({args.bitrate})")
+            
+    except ConfigurationError as e:
+        print(f"[ERROR] Output configuration error: {str(e)}")
+        logging.error(f"Output configuration error: {str(e)}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[ERROR] Unexpected error during output setup: {str(e)}")
+        logging.error(f"Unexpected error during output setup: {str(e)}")
+        sys.exit(1)
     
     # Check if output file already exists
     if os.path.exists(output_file):
