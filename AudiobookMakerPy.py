@@ -1,20 +1,3 @@
-# Custom exceptions
-class ConversionError(Exception):
-    """Raised when there is a problem with audio file conversion."""
-    pass
-
-class AudioDurationError(Exception):
-    """Raised when there is a problem getting the duration of an audio file."""
-    pass
-
-class AudioPropertiesError(Exception):
-    """Raised when there is a problem getting the properties of an audio file."""
-    pass
-
-class MetadataError(Exception):
-    """Raised when there is a problem with copying metadata from one file to another."""
-    pass
-
 # Standard library imports
 import sys
 import os
@@ -25,6 +8,14 @@ import shutil
 import re
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
+
+# Application-specific imports
+from exceptions import (
+    AudiobookMakerError, DependencyError, FileProcessingError, ConversionError,
+    MetadataError, ValidationError, ResourceError, ConfigurationError,
+    ProcessingError, ConcatenationError, InterruptedError,
+    classify_error, get_error_summary
+)
 
 # Audio processing imports
 try:
@@ -48,8 +39,7 @@ except ImportError:
     logging.info('pydub not available - using fallback subprocess method')
     
 if not MUTAGEN_AVAILABLE:
-    print("ERROR: mutagen is required. Please install with: pip install -r requirements.txt")
-    sys.exit(1)
+    raise DependencyError("mutagen", "mutagen is required for metadata handling")
 
 # Global variables
 max_cpu_cores = min(5, os.cpu_count() or 1)  # Number of cores to use for parallel processing, use all available cores by default
@@ -86,7 +76,7 @@ def get_audio_duration(input_file):
         return int(float(output) * 1000)  # convert duration from seconds to milliseconds
     except subprocess.CalledProcessError as e:
         logging.error(f'Error occurred while getting duration for {input_file}: {str(e)}')
-        raise AudioDurationError(f"Getting duration of {input_file} failed.") from e
+        raise FileProcessingError(f"Getting duration failed: {str(e)}", input_file, "duration_extraction") from e
 
 def get_audio_properties(input_file):
     """
@@ -120,7 +110,7 @@ def get_audio_properties(input_file):
         }
     except subprocess.CalledProcessError as e:
         logging.error(f'Error occurred while getting properties for {input_file}: {str(e)}')
-        raise AudioPropertiesError(f"Getting properties of {input_file} failed.") from e
+        raise FileProcessingError(f"Getting properties failed: {str(e)}", input_file, "properties_extraction") from e
 
 def ms_to_timestamp(ms):
     """
@@ -178,7 +168,9 @@ def convert_to_aac(input_file, output_file, bitrate):
             os.remove(output_file)
 
         # Raise an exception to stop the script due to the error
-        raise ConversionError(f"Conversion of {input_file} failed.") from e
+        raise ConversionError(f"Conversion failed: {str(e)}", input_file, 
+                              source_format=os.path.splitext(input_file)[1], 
+                              target_format=".m4a") from e
 
     return output_file
 
@@ -368,7 +360,7 @@ def _add_chapters_to_file(audiofile, chapters):
         # Continue without chapters rather than failing completely
 
 def process_audio_files(input_files, output_file, bitrate="128k", cores=None):
-    """Processes audio files using pydub, converts and concatenates them.
+    """Processes audio files using pydub, converts and concatenates them with enhanced error handling.
 
     Args:
         input_files (list): List of paths to input audio files.
@@ -377,13 +369,14 @@ def process_audio_files(input_files, output_file, bitrate="128k", cores=None):
         cores (int): Number of CPU cores to use.
 
     Returns:
-        list: List of durations in milliseconds for each input file.
+        tuple: (durations_list, errors_list) - Successfully processed durations and any errors encountered.
     """
     global tempdir
 
     tempdir = tempfile.mkdtemp()
     converted_files = []
     durations = []
+    processing_errors = []
     cores_to_use = cores or max_cpu_cores
     
     try:
@@ -392,30 +385,67 @@ def process_audio_files(input_files, output_file, bitrate="128k", cores=None):
         print(f"Using {cores_to_use} CPU cores")
         
         with ProcessPoolExecutor(max_workers=cores_to_use) as executor:
-            # Define a list of future tasks for conversion
-            future_tasks = [executor.submit(convert_file_for_concatenation, input_file, tempdir, bitrate)
-                            for input_file in input_files]
+            # Create tasks with error handling
+            future_to_file = {
+                executor.submit(convert_file_for_concatenation, input_file, tempdir, bitrate): input_file
+                for input_file in input_files
+            }
             
-            # Collect results with progress indication
+            # Collect results with skip-and-continue logic
             completed = 0
-            for future in future_tasks:
-                temp_file_path, duration_ms = future.result()
-                converted_files.append(temp_file_path)
-                durations.append(duration_ms)
+            successful = 0
+            for future in future_to_file:
+                input_file = future_to_file[future]
+                try:
+                    temp_file_path, duration_ms = future.result()
+                    converted_files.append(temp_file_path)
+                    durations.append(duration_ms)
+                    successful += 1
+                    print(f"[OK] Converted {os.path.basename(input_file)}")
+                except FileProcessingError as e:
+                    processing_errors.append(e)
+                    print(f"[FAIL] Failed to convert {os.path.basename(input_file)}: {e}")
+                    logging.warning(f"Skipping file due to conversion error: {e}")
+                except Exception as e:
+                    # Wrap unexpected errors
+                    wrapped_error = ProcessingError(f"Unexpected error: {str(e)}", "conversion", recoverable=False)
+                    processing_errors.append(wrapped_error)
+                    print(f"[ERROR] Unexpected error with {os.path.basename(input_file)}: {e}")
+                    logging.error(f"Unexpected error during conversion: {e}")
+                
                 completed += 1
-                print(f"Converted {completed}/{len(input_files)} files")
+                print(f"Progress: {completed}/{len(input_files)} files processed ({successful} successful)")
+
+        # Only proceed with concatenation if we have some successful conversions
+        if not converted_files:
+            raise ProcessingError("No files were successfully converted", "conversion", recoverable=False)
+        elif len(converted_files) < len(input_files):
+            print(f"\nWarning: Only {len(converted_files)}/{len(input_files)} files converted successfully")
+            print("Proceeding with available files...")
 
         print(f"\nConcatenating {len(converted_files)} files into audiobook...")
-        # Concatenate files using optimized strategy
-        _concatenate_audio_files(converted_files, output_file, tempdir)
+        try:
+            _concatenate_audio_files(converted_files, output_file, tempdir)
+            print(f"Successfully created: {output_file}")
+        except ConcatenationError as e:
+            processing_errors.append(e)
+            raise  # Re-raise concatenation errors as they're fatal
         
-        print(f"Successfully created: {output_file}")
-        return durations
+        return durations, processing_errors
 
-    except (ConversionError, Exception) as e:
-        print(f"Error during processing: {str(e)}")
-        logging.error(f'An error occurred during processing: {str(e)}')
-        return None
+    except (DependencyError, ResourceError, ConfigurationError) as e:
+        # Fatal errors that prevent continuation
+        processing_errors.append(e)
+        print(f"Fatal error: {e.get_user_message()}")
+        logging.error(f'Fatal error during processing: {str(e)}')
+        raise
+    except Exception as e:
+        # Wrap other unexpected errors
+        wrapped_error = ProcessingError(f"Unexpected processing error: {str(e)}", "processing", recoverable=False)
+        processing_errors.append(wrapped_error)
+        print(f"Unexpected error during processing: {str(e)}")
+        logging.error(f'Unexpected error during processing: {str(e)}')
+        raise wrapped_error
 
 def setup_logging(quiet=False):
     """
@@ -628,17 +658,26 @@ def check_ffmpeg_dependency():
     Checks if FFmpeg is available and accessible.
     
     Raises:
-        SystemExit: If FFmpeg is not found or not accessible.
+        DependencyError: If FFmpeg is not found or not accessible.
     """
     try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, text=True)
         logging.info('FFmpeg dependency check passed')
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("ERROR: FFmpeg is required but not found.")
-        print("Please install FFmpeg and ensure it's in your system PATH.")
-        print("Download from: https://ffmpeg.org/")
-        logging.error('FFmpeg dependency check failed - FFmpeg not found or not accessible')
-        sys.exit(1)
+        
+        # Extract version information
+        version_line = result.stderr.split('\n')[0] if result.stderr else result.stdout.split('\n')[0]
+        return version_line
+        
+    except FileNotFoundError:
+        raise DependencyError(
+            "ffmpeg",
+            "FFmpeg is not installed or not found in system PATH"
+        )
+    except subprocess.CalledProcessError as e:
+        raise DependencyError(
+            "ffmpeg", 
+            f"FFmpeg is installed but not working properly: {e}"
+        )
 
 def load_audio_segment(file_path):
     """
@@ -659,7 +698,7 @@ def load_audio_segment(file_path):
         return audio_segment
     except Exception as e:
         logging.error(f'Error loading audio file {file_path}: {str(e)}')
-        raise AudioPropertiesError(f"Loading audio file {file_path} failed.") from e
+        raise FileProcessingError(f"Loading audio file failed: {str(e)}", file_path, "audio_loading") from e
 
 def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
     """
@@ -710,7 +749,9 @@ def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
         
     except Exception as e:
         logging.error(f'Error converting {input_file}: {str(e)}')
-        raise ConversionError(f"Conversion of {input_file} failed.") from e
+        raise ConversionError(f"Conversion failed: {str(e)}", input_file, 
+                              source_format=os.path.splitext(input_file)[1], 
+                              target_format=".m4a") from e
 
 def get_audio_duration_fallback(input_file):
     """
@@ -725,7 +766,7 @@ def get_audio_duration_fallback(input_file):
         return int(float(output) * 1000)  # convert to milliseconds
     except subprocess.CalledProcessError as e:
         logging.error(f'Error getting duration for {input_file}: {str(e)}')
-        raise AudioDurationError(f"Getting duration of {input_file} failed.") from e
+        raise FileProcessingError(f"Getting duration failed: {str(e)}", input_file, "duration_extraction") from e
 
 def _concatenate_audio_files(converted_files, output_file, temp_dir):
     """
@@ -746,7 +787,7 @@ def _concatenate_audio_files(converted_files, output_file, temp_dir):
             _concatenate_with_ffmpeg(converted_files, output_file, temp_dir)
     except Exception as e:
         logging.error(f'Concatenation failed: {str(e)}')
-        raise ConversionError(f"Audio concatenation failed: {str(e)}") from e
+        raise ConcatenationError(f"Audio concatenation failed: {str(e)}") from e
 
 def _concatenate_with_pydub(converted_files, output_file):
     """
@@ -816,7 +857,7 @@ def _concatenate_with_ffmpeg(converted_files, output_file, temp_dir):
     
     if result.returncode != 0:
         logging.error(f'FFmpeg concatenation failed: {result.stderr}')
-        raise ConversionError(f"FFmpeg concatenation failed: {result.stderr}")
+        raise ConcatenationError(f"FFmpeg concatenation failed: {result.stderr}")
     
     logging.info(f'Successfully concatenated {len(converted_files)} files to {output_file}')
 
@@ -842,13 +883,8 @@ if __name__ == '__main__':
     # Setup logging with quiet mode support
     setup_logging(quiet=args.quiet)
     
-    print("AudiobookMakerPy v2.0 - Phase 4")
+    print("AudiobookMakerPy v2.0 - Phase 2.1 (Enhanced Error Handling)")
     print("=" * 50)
-    
-    # Check dependencies first
-    print("Checking dependencies...")
-    check_ffmpeg_dependency()
-    print("FFmpeg dependency check passed")
     
     # Validate and collect input files
     input_files = validate_and_get_input_files(args.input_paths)
@@ -865,29 +901,45 @@ if __name__ == '__main__':
             print("Operation cancelled by user")
             sys.exit(0)
     
+    all_errors = []
+    
     try:
+        # Check dependencies first
+        print("Checking dependencies...")
+        ffmpeg_version = check_ffmpeg_dependency()
+        print("FFmpeg dependency check passed")
+        logging.info(f'FFmpeg version: {ffmpeg_version}')
+        
         # Process files and get durations
-        file_durations = process_audio_files(
+        file_durations, processing_errors = process_audio_files(
             input_files, 
             output_file, 
             bitrate=args.bitrate,
             cores=args.cores
         )
         
-        if file_durations is None:
-            print("Processing failed - exiting")
-            logging.error('Processing failed - exiting')
+        # Collect any processing errors
+        all_errors.extend(processing_errors)
+        
+        if not file_durations:
+            print("No files were successfully processed - exiting")
+            logging.error('No files were successfully processed')
             sys.exit(1)
         
         # Add comprehensive metadata using mutagen
         print(f"\nAdding metadata and chapters...")
-        add_metadata_to_audiobook(
-            output_file, 
-            input_files, 
-            file_durations,
-            title=args.title,
-            author=args.author
-        )
+        try:
+            add_metadata_to_audiobook(
+                output_file, 
+                input_files, 
+                file_durations,
+                title=args.title,
+                author=args.author
+            )
+        except MetadataError as e:
+            all_errors.append(e)
+            print(f"Warning: Metadata processing failed: {e}")
+            logging.warning(f"Metadata processing failed but audiobook was created: {e}")
         
         # Calculate total duration for summary
         total_duration_ms = sum(file_durations)
@@ -896,22 +948,51 @@ if __name__ == '__main__':
         
         print(f"\nAudiobook creation complete!")
         print(f"Summary:")
-        print(f"   - Files processed: {len(input_files)}")
+        print(f"   - Files processed: {len(file_durations)}/{len(input_files)}")
         print(f"   - Total duration: {total_hours}h {total_minutes}m")
         print(f"   - Output: {output_file}")
         print(f"   - Bitrate: {args.bitrate}")
         
+        # Display error summary if there were any issues
+        if all_errors:
+            print(f"\nError Summary:")
+            print("=" * 50)
+            print(get_error_summary(all_errors))
+        
         logging.info('Audiobook creation complete.')
         
     except KeyboardInterrupt:
+        interrupted_error = InterruptedError("Processing cancelled by user", "main_processing", recoverable=True)
+        all_errors.append(interrupted_error)
         print(f"\nOperation cancelled by user")
         sys.exit(0)
+    except DependencyError as e:
+        all_errors.append(e)
+        print(f"\nDependency Error: {e.get_user_message()}")
+        logging.error(f'Dependency error: {str(e)}')
+        sys.exit(1)
+    except AudiobookMakerError as e:
+        all_errors.append(e)
+        print(f"\nError: {e.get_user_message()}")
+        logging.error(f'Application error: {str(e)}')
+        sys.exit(1)
     except Exception as e:
+        unexpected_error = ProcessingError(f"Unexpected error: {str(e)}", "main", recoverable=False)
+        all_errors.append(unexpected_error)
         print(f"\nUnexpected error: {str(e)}")
         logging.error(f'Unexpected error: {str(e)}')
         sys.exit(1)
     finally:
         # Always cleanup temp directory
         if tempdir and os.path.exists(tempdir):
-            cleanup_tempdir()
-            print("Cleaned up temporary files")
+            try:
+                cleanup_tempdir()
+                print("Cleaned up temporary files")
+            except Exception as e:
+                cleanup_error = ResourceError(f"Failed to cleanup temporary files: {str(e)}", "cleanup")
+                all_errors.append(cleanup_error)
+                print(f"Warning: Failed to cleanup temporary files: {e}")
+        
+        # Final error reporting
+        if all_errors and len(all_errors) > 0:
+            logging.info(f'Session completed with {len(all_errors)} total errors')
