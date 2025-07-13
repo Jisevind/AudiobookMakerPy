@@ -52,7 +52,7 @@ if not MUTAGEN_AVAILABLE:
     sys.exit(1)
 
 # Global variables
-max_cpu_cores = os.cpu_count()  # Number of cores to use for parallel processing, use all available cores by default
+max_cpu_cores = 5 #os.cpu_count()  # Number of cores to use for parallel processing, use all available cores by default
 tempdir = None
 
 def atoi(text):
@@ -239,9 +239,28 @@ def copy_metadata(input_file, output_file):
         # Run the ffmpeg command
         subprocess.run(ffmpeg_command, check=True)
 
-        # Remove the original output file
+        # Wait a moment for file handles to close (Windows issue)
+        import time
+        time.sleep(1)
+        
+        # Remove the original output file with retry logic
         if os.path.exists(output_file):
-            os.remove(output_file)
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    os.remove(output_file)
+                    break
+                except PermissionError:
+                    if attempt < max_retries - 1:
+                        logging.warning(f'File locked, retrying in {attempt + 1} seconds...')
+                        time.sleep(attempt + 1)
+                    else:
+                        # If all retries fail, use alternative approach
+                        logging.warning('Cannot remove original file due to locking - using alternative filename')
+                        final_output = output_file.replace('.m4b', '_final.m4b')
+                        os.rename(output_temp_file, final_output)
+                        logging.info(f'Output saved as: {final_output}')
+                        return
 
         # Rename the temp output file to the original output file
         os.rename(output_temp_file, output_file)
@@ -288,36 +307,8 @@ def process_audio_files(input_files, output_file):
                 converted_files.append(temp_file_path)
                 durations.append(duration_ms)
 
-        # Concatenate files - use pydub if available, otherwise use FFmpeg
-        if PYDUB_AVAILABLE:
-            logging.info(f'Concatenating {len(converted_files)} files using pydub')
-            final_audio = AudioSegment.empty()
-            
-            for temp_file in converted_files:
-                audio_segment = AudioSegment.from_file(temp_file)
-                final_audio += audio_segment
-                
-            # Export the final concatenated audio to M4B format
-            logging.info(f'Exporting final audiobook to {output_file}')
-            final_audio.export(
-                output_file,
-                format="ipod",  # M4B compatible format
-                bitrate="128k",
-                parameters=["-ar", "44100", "-ac", "2"]
-            )
-        else:
-            # Fallback: Use FFmpeg concat demuxer
-            logging.info(f'Concatenating {len(converted_files)} files using FFmpeg')
-            concat_file = os.path.join(tempdir, 'concat_list.txt')
-            with open(concat_file, 'w') as f:
-                for temp_file in converted_files:
-                    f.write(f"file '{temp_file}'\n")
-            
-            ffmpeg_concat_command = [
-                'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
-                '-c', 'copy', output_file
-            ]
-            subprocess.run(ffmpeg_concat_command, check=True)
+        # Concatenate files using optimized strategy
+        _concatenate_audio_files(converted_files, output_file, tempdir)
         
         return durations
 
@@ -411,8 +402,14 @@ def get_output_file(input_files):
         str: The output file path for the audiobook.
     """
     folder_path = os.path.dirname(input_files[0])
+    parent_path = os.path.dirname(folder_path)
     output_name = os.path.basename(folder_path) + '.m4b'
-    return os.path.join(folder_path, output_name)
+    
+    # Put output file in parent directory to avoid including it in future runs
+    if parent_path:  # If there's a parent directory, use it
+        return os.path.join(parent_path, output_name)
+    else:  # If no parent (root directory), use current directory
+        return output_name
 
 def check_ffmpeg_dependency():
     """
@@ -518,6 +515,99 @@ def get_audio_duration_fallback(input_file):
         logging.error(f'Error getting duration for {input_file}: {str(e)}')
         raise AudioDurationError(f"Getting duration of {input_file} failed.") from e
 
+def _concatenate_audio_files(converted_files, output_file, temp_dir):
+    """
+    Concatenates audio files using the best available method.
+    
+    Args:
+        converted_files (list): List of temporary converted file paths.
+        output_file (str): Path for the final output file.
+        temp_dir (str): Temporary directory for intermediate files.
+        
+    Raises:
+        ConversionError: If concatenation fails.
+    """
+    try:
+        if PYDUB_AVAILABLE:
+            _concatenate_with_pydub(converted_files, output_file)
+        else:
+            _concatenate_with_ffmpeg(converted_files, output_file, temp_dir)
+    except Exception as e:
+        logging.error(f'Concatenation failed: {str(e)}')
+        raise ConversionError(f"Audio concatenation failed: {str(e)}") from e
+
+def _concatenate_with_pydub(converted_files, output_file):
+    """
+    Concatenates audio files using pydub (when available).
+    """
+    logging.info(f'Concatenating {len(converted_files)} files using pydub')
+    
+    # Load first file to establish format
+    final_audio = AudioSegment.from_file(converted_files[0])
+    
+    # Add remaining files
+    for temp_file in converted_files[1:]:
+        audio_segment = AudioSegment.from_file(temp_file)
+        final_audio += audio_segment
+        logging.debug(f'Added {temp_file} to concatenation')
+    
+    # Export with optimized settings
+    logging.info(f'Exporting final audiobook to {output_file}')
+    final_audio.export(
+        output_file,
+        format="ipod",  # M4B compatible format
+        bitrate="128k",
+        parameters=[
+            "-ar", "44100",  # Sample rate
+            "-ac", "2",      # Stereo
+            "-movflags", "+faststart"  # Optimize for streaming
+        ]
+    )
+    
+    logging.info(f'Successfully exported {len(converted_files)} files to {output_file}')
+
+def _concatenate_with_ffmpeg(converted_files, output_file, temp_dir):
+    """
+    Concatenates audio files using FFmpeg concat demuxer (fallback method).
+    """
+    logging.info(f'Concatenating {len(converted_files)} files using FFmpeg')
+    
+    # Create concat list file with proper escaping
+    concat_file = os.path.join(temp_dir, 'concat_list.txt')
+    with open(concat_file, 'w', encoding='utf-8') as f:
+        for temp_file in converted_files:
+            # Escape file paths for FFmpeg
+            escaped_path = temp_file.replace('\\', '/').replace("'", "'\\''")
+            f.write(f"file '{escaped_path}'\n")
+    
+    # Remove existing output file to avoid overwrite prompts
+    if os.path.exists(output_file):
+        try:
+            os.remove(output_file)
+        except PermissionError:
+            logging.warning(f'Could not remove existing {output_file}, FFmpeg will overwrite')
+    
+    # Enhanced FFmpeg concatenation command
+    ffmpeg_concat_command = [
+        'ffmpeg', 
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_file,
+        '-c', 'copy',  # Copy streams without re-encoding
+        '-movflags', '+faststart',  # Optimize for streaming
+        '-y',  # Overwrite output file
+        output_file
+    ]
+    
+    logging.debug(f'Running FFmpeg command: {" ".join(ffmpeg_concat_command)}')
+    result = subprocess.run(ffmpeg_concat_command, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        logging.error(f'FFmpeg concatenation failed: {result.stderr}')
+        raise ConversionError(f"FFmpeg concatenation failed: {result.stderr}")
+    
+    logging.info(f'Successfully concatenated {len(converted_files)} files to {output_file}')
+
 def cleanup_tempdir():
     """
     Removes the temporary directory used during audiobook creation process.
@@ -545,6 +635,10 @@ if __name__ == '__main__':
 
     # Process files and get durations (no longer using MP4Box)
     file_durations = process_audio_files(input_files, output_file)
+    
+    if file_durations is None:
+        logging.error('Processing failed - exiting')
+        sys.exit(1)
     
     # Copy metadata from first input file to output
     copy_metadata(input_files[0], output_file)
