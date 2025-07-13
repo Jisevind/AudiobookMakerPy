@@ -31,7 +31,7 @@ from progress_tracker import (
 # Audio processing imports
 try:
     # Import mutagen (always works)
-    from mutagen.mp4 import MP4
+    from mutagen.mp4 import MP4, MP4Cover
     MUTAGEN_AVAILABLE = True
 except ImportError:
     MUTAGEN_AVAILABLE = False
@@ -222,6 +222,155 @@ def validate_output_path(output_path):
         
     except Exception as e:
         return False, f"Output path validation error: {str(e)}"
+
+def get_chapter_title(file_path):
+    """
+    Get the best possible chapter title using Gemini's fallback strategy.
+    
+    Phase 3.3: Smart chapter naming with three-tier fallback:
+    1. Priority 1: Read title tag from metadata
+    2. Priority 2: Use filename (cleaned)
+    3. Priority 3: Generic chapter name
+    
+    Args:
+        file_path: Path to the audio file
+        
+    Returns:
+        String containing the best available chapter title
+    """
+    try:
+        # Priority 1: Try to read title tag using mutagen
+        if MUTAGEN_AVAILABLE:
+            from mutagen import File
+            audio_file = File(file_path)
+            
+            if audio_file is not None:
+                # Common title tag mappings across formats
+                title_tags = ['TIT2', 'TITLE', '\xa9nam']  # ID3, Vorbis, MP4
+                
+                for tag in title_tags:
+                    if tag in audio_file and audio_file[tag]:
+                        title = str(audio_file[tag][0]).strip()
+                        if title and not title.isspace():
+                            logging.debug(f"Found title tag for {file_path}: {title}")
+                            return title
+        
+        # Priority 2: Use filename (cleaned)
+        filename = os.path.splitext(os.path.basename(file_path))[0]
+        
+        # Clean up common filename patterns
+        import re
+        # Remove track numbers (01, 001, 1., 01-, etc.)
+        cleaned = re.sub(r'^[\d\s\-\.]+', '', filename).strip()
+        
+        # Remove common prefixes
+        cleaned = re.sub(r'^(chapter|track|part)\s*[\d\s\-\.]*', '', cleaned, flags=re.IGNORECASE).strip()
+        
+        if cleaned and not cleaned.isspace():
+            logging.debug(f"Using cleaned filename for {file_path}: {cleaned}")
+            return cleaned
+        
+        # If cleaning removed everything, use original filename
+        if filename and not filename.isspace():
+            logging.debug(f"Using original filename for {file_path}: {filename}")
+            return filename
+            
+    except Exception as e:
+        logging.warning(f"Error extracting chapter title from {file_path}: {e}")
+    
+    # Priority 3: Generic fallback
+    generic_title = f"Chapter {os.path.basename(file_path)}"
+    logging.debug(f"Using generic title for {file_path}: {generic_title}")
+    return generic_title
+
+def extract_comprehensive_metadata(input_files):
+    """
+    Extract comprehensive metadata from all source files.
+    
+    Phase 3.3: Enhanced metadata extraction with inheritance and conflict resolution.
+    Builds upon Phase 3.2's basic extraction to provide rich metadata for chapters.
+    
+    Args:
+        input_files: List of input audio file paths
+        
+    Returns:
+        Dict containing comprehensive metadata including chapter titles
+    """
+    metadata = {
+        'title': 'Audiobook',
+        'author': 'Unknown Author', 
+        'album': 'Unknown Album',
+        'year': datetime.now().strftime('%Y'),
+        'date': datetime.now().strftime('%Y-%m-%d'),
+        'chapter_titles': [],
+        'source_metadata': {}
+    }
+    
+    if not input_files:
+        return metadata
+    
+    # Extract chapter titles from all files
+    for file_path in input_files:
+        chapter_title = get_chapter_title(file_path)
+        metadata['chapter_titles'].append(chapter_title)
+    
+    # Extract base metadata from first file (Phase 3.3 inheritance)
+    if MUTAGEN_AVAILABLE:
+        try:
+            from mutagen import File
+            first_file = File(input_files[0])
+            
+            if first_file is not None:
+                # Store comprehensive source metadata
+                metadata['source_metadata'] = dict(first_file)
+                
+                # Extract primary metadata with priority order
+                title_tags = ['TIT2', 'TITLE', '\xa9nam', 'TALB', 'ALBUM', '\xa9alb']  # Include album as title fallback
+                artist_tags = ['TPE1', 'ARTIST', '\xa9ART', 'TPE2', 'ALBUMARTIST', '\xa9art']  # Include album artist
+                album_tags = ['TALB', 'ALBUM', '\xa9alb']
+                date_tags = ['TDRC', 'DATE', '\xa9day', 'TYER', 'YEAR']
+                
+                # Extract album/book title (primary metadata)
+                for tag in album_tags:
+                    if tag in first_file and first_file[tag]:
+                        title = str(first_file[tag][0]).strip()
+                        if title:
+                            metadata['title'] = title
+                            metadata['album'] = title
+                            break
+                
+                # Extract artist/author
+                for tag in artist_tags:
+                    if tag in first_file and first_file[tag]:
+                        artist = str(first_file[tag][0]).strip()
+                        if artist:
+                            metadata['author'] = artist
+                            break
+                
+                # Extract year/date
+                for tag in date_tags:
+                    if tag in first_file and first_file[tag]:
+                        date_str = str(first_file[tag][0]).strip()
+                        if date_str:
+                            # Extract year from date string
+                            import re
+                            year_match = re.search(r'\b(19|20)\d{2}\b', date_str)
+                            if year_match:
+                                metadata['year'] = year_match.group()
+                            break
+                            
+        except Exception as e:
+            logging.warning(f"Error extracting comprehensive metadata: {e}")
+    
+    # Fallback to basic extraction for template compatibility
+    basic_metadata = extract_metadata_for_template(input_files)
+    for key in ['title', 'author', 'album', 'year', 'date']:
+        if key not in metadata or metadata[key] in ['Audiobook', 'Unknown Author', 'Unknown Album']:
+            if key in basic_metadata and basic_metadata[key] not in ['Audiobook', 'Unknown Author', 'Unknown Album']:
+                metadata[key] = basic_metadata[key]
+    
+    logging.info(f"Extracted metadata for {len(input_files)} files: {len(metadata['chapter_titles'])} chapter titles")
+    return metadata
 
 def determine_output_path(input_files, args, metadata):
     """
@@ -455,70 +604,162 @@ def create_chapters_for_mutagen(input_files, durations):
     logging.info(f'Created {len(chapters)} chapters for metadata')
     return chapters
 
-def add_metadata_to_audiobook(output_file, input_files, durations, title=None, author=None):
+def create_smart_chapters_for_mutagen(input_files, durations, chapter_titles):
     """
-    Adds comprehensive metadata to the audiobook using mutagen.
+    Create chapter information using smart extracted titles.
+    
+    Phase 3.3: Enhanced chapter creation with intelligent titles from metadata/filenames.
+    
+    Args:
+        input_files (list): List of input file paths.
+        durations (list): List of durations in milliseconds.
+        chapter_titles (list): Smart extracted chapter titles.
+        
+    Returns:
+        list: Chapter information for mutagen.
+    """
+    if len(input_files) != len(durations) or len(input_files) != len(chapter_titles):
+        raise ValueError("Mismatch between number of files, durations, and chapter titles")
+    
+    chapters = []
+    current_time = 0
+    
+    for i, (input_file, duration, title) in enumerate(zip(input_files, durations, chapter_titles)):
+        chapter = {
+            'start_time': current_time,
+            'title': title
+        }
+        chapters.append(chapter)
+        current_time += duration
+        
+        logging.debug(f'Smart chapter {i+1}: "{title}" at {current_time}ms')
+    
+    logging.info(f'Created {len(chapters)} smart chapters with intelligent titles')
+    return chapters
+
+def add_metadata_to_audiobook(output_file, input_files, durations, metadata=None, cover_art_path=None, chapter_titles=None):
+    """
+    Adds comprehensive metadata to the audiobook using Phase 3.3 smart extraction.
+    
+    Phase 3.3: Enhanced metadata writing with smart chapter titles, metadata inheritance,
+    and cover art support using mutagen's surgical precision.
     
     Args:
         output_file (str): Path to the output M4B file.
         input_files (list): List of input file paths.
         durations (list): List of durations in milliseconds.
-        title (str, optional): Custom title for the audiobook.
-        author (str, optional): Custom author for the audiobook.
+        metadata (dict, optional): Comprehensive metadata from smart extraction.
+        cover_art_path (str, optional): Path to cover art image file.
+        chapter_titles (list, optional): Smart chapter titles from extraction.
         
     Raises:
         MetadataError: If metadata processing fails.
     """
     try:
-        logging.info(f'Adding metadata to {output_file} using mutagen')
+        logging.info(f'Adding enhanced metadata to {output_file} using Phase 3.3 smart extraction')
         
         # Open the M4B file with mutagen
         audiofile = MP4(output_file)
         
-        # Extract basic metadata from first input file for defaults
-        first_file_metadata = _extract_metadata_from_source(input_files[0])
-        
-        # Set basic metadata
-        if title:
-            audiofile['\xa9nam'] = title
-        elif first_file_metadata.get('album'):
-            audiofile['\xa9nam'] = first_file_metadata['album']
+        # Use comprehensive metadata if available, fallback to legacy extraction
+        if metadata:
+            # Phase 3.3: Use smart extracted metadata
+            audiofile['\xa9nam'] = metadata.get('title', 'Audiobook')
+            audiofile['\xa9alb'] = metadata.get('album', metadata.get('title', 'Audiobook'))  # Album = title for audiobooks
+            audiofile['\xa9ART'] = metadata.get('author', 'Unknown Author')
+            audiofile['aART'] = metadata.get('author', 'Unknown Author')  # Album artist
+            
+            if metadata.get('year'):
+                audiofile['\xa9day'] = metadata['year']
+                
+            # Preserve additional metadata from source files
+            source_metadata = metadata.get('source_metadata', {})
+            
+            # Copy genre if available
+            for genre_tag in ['\xa9gen', 'TCON', 'GENRE']:
+                if genre_tag in source_metadata:
+                    audiofile['\xa9gen'] = str(source_metadata[genre_tag][0]) if isinstance(source_metadata[genre_tag], list) else str(source_metadata[genre_tag])
+                    break
+                    
+            # Copy comment/description if available  
+            for comment_tag in ['\xa9cmt', 'COMM::eng', 'COMMENT']:
+                if comment_tag in source_metadata:
+                    comment_value = source_metadata[comment_tag]
+                    if isinstance(comment_value, list) and comment_value:
+                        audiofile['\xa9cmt'] = str(comment_value[0])
+                    elif comment_value:
+                        audiofile['\xa9cmt'] = str(comment_value)
+                    break
+                    
         else:
-            # Generate title from directory name
-            dir_name = os.path.basename(os.path.dirname(input_files[0]))
-            audiofile['\xa9nam'] = dir_name
+            # Fallback to legacy metadata extraction
+            first_file_metadata = _extract_metadata_from_source(input_files[0])
             
-        if author:
-            audiofile['\xa9ART'] = author
-            audiofile['aART'] = author  # Album artist
-        elif first_file_metadata.get('artist'):
-            audiofile['\xa9ART'] = first_file_metadata['artist']
-            audiofile['aART'] = first_file_metadata.get('album_artist', first_file_metadata['artist'])
+            audiofile['\xa9nam'] = first_file_metadata.get('album', os.path.basename(os.path.dirname(input_files[0])))
+            audiofile['\xa9alb'] = first_file_metadata.get('album', audiofile['\xa9nam'])
+            audiofile['\xa9ART'] = first_file_metadata.get('artist', 'Unknown Author')
+            audiofile['aART'] = first_file_metadata.get('album_artist', audiofile['\xa9ART'])
             
-        # Set additional metadata
-        if first_file_metadata.get('album'):
-            audiofile['\xa9alb'] = first_file_metadata['album']
-        if first_file_metadata.get('date'):
-            audiofile['\xa9day'] = first_file_metadata['date']
-        if first_file_metadata.get('genre'):
-            audiofile['\xa9gen'] = first_file_metadata['genre']
-        if first_file_metadata.get('comment'):
-            audiofile['\xa9cmt'] = first_file_metadata['comment']
+            if first_file_metadata.get('date'):
+                audiofile['\xa9day'] = first_file_metadata['date']
+            if first_file_metadata.get('genre'):
+                audiofile['\xa9gen'] = first_file_metadata['genre']
+            if first_file_metadata.get('comment'):
+                audiofile['\xa9cmt'] = first_file_metadata['comment']
             
         # Set as audiobook
         audiofile['stik'] = [2]  # Audiobook media type
         
-        # Create and add chapters
-        chapters = create_chapters_for_mutagen(input_files, durations)
+        # Phase 3.3: Add cover art if provided
+        if cover_art_path:
+            try:
+                with open(cover_art_path, 'rb') as cover_file:
+                    cover_data = cover_file.read()
+                    
+                # Determine cover format
+                cover_ext = os.path.splitext(cover_art_path)[1].lower()
+                if cover_ext in ['.jpg', '.jpeg']:
+                    cover_format = MP4Cover.FORMAT_JPEG
+                elif cover_ext == '.png':
+                    cover_format = MP4Cover.FORMAT_PNG
+                else:
+                    raise MetadataError(f"Unsupported cover art format: {cover_ext}")
+                
+                # Create MP4Cover object and add to file
+                cover = MP4Cover(cover_data, cover_format)
+                audiofile['covr'] = [cover]
+                logging.info(f'Added cover art from {cover_art_path} ({len(cover_data)} bytes)')
+                
+            except Exception as e:
+                logging.warning(f'Failed to add cover art: {e}')
+                # Continue without cover art rather than failing
+        
+        # Phase 3.3: Create and add smart chapters
+        if chapter_titles:
+            chapters = create_smart_chapters_for_mutagen(input_files, durations, chapter_titles)
+        else:
+            chapters = create_chapters_for_mutagen(input_files, durations)
+            
         _add_chapters_to_file(audiofile, chapters)
         
         # Save the metadata
         audiofile.save()
-        logging.info(f'Successfully added metadata and {len(chapters)} chapters to {output_file}')
+        
+        chapter_count = len(chapters)
+        features_added = []
+        if cover_art_path:
+            features_added.append("cover art")
+        if chapter_titles:
+            features_added.append("smart chapter titles")
+        if metadata and metadata.get('source_metadata'):
+            features_added.append("inherited metadata")
+            
+        features_str = f" with {', '.join(features_added)}" if features_added else ""
+        logging.info(f'Successfully added enhanced metadata and {chapter_count} chapters{features_str} to {output_file}')
         
     except Exception as e:
-        logging.error(f'Error adding metadata to {output_file}: {str(e)}')
-        raise MetadataError(f"Adding metadata to {output_file} failed: {str(e)}") from e
+        logging.error(f'Error adding enhanced metadata to {output_file}: {str(e)}')
+        raise MetadataError(f"Adding enhanced metadata to {output_file} failed: {str(e)}") from e
 
 def _extract_metadata_from_source(input_file):
     """
@@ -802,6 +1043,11 @@ Phase 3.2 - Flexible Output Control:
   python AudiobookMakerPy.py /path/to/files/ --quality high --template "{author} - {title}"
   python AudiobookMakerPy.py /path/to/files/ --template "{author} - {album} ({year})"
 
+Phase 3.3 - Smart Metadata Extraction:
+  python AudiobookMakerPy.py /path/to/files/ --cover cover.jpg --chapter-titles auto
+  python AudiobookMakerPy.py /path/to/files/ --cover art.png --chapter-titles filename
+  python AudiobookMakerPy.py /path/to/files/ --quality high --cover cover.jpg
+
 Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         """
     )
@@ -880,10 +1126,24 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         help='Filename template using metadata variables: {title}, {author}, {album}, {year} (default: {title})'
     )
     
+    # Phase 3.3: Smart Metadata Extraction arguments
+    parser.add_argument(
+        '--cover', '--cover-art',
+        type=str,
+        help='Path to cover art image file (JPEG, PNG) to embed in audiobook'
+    )
+    
+    parser.add_argument(
+        '--chapter-titles',
+        choices=['auto', 'filename', 'generic'],
+        default='auto',
+        help='Chapter title source: auto (smart extraction), filename (use filenames), generic (Chapter 1, 2, etc.)'
+    )
+    
     parser.add_argument(
         '--version', '-v',
         action='version',
-        version='AudiobookMakerPy 2.0 (Phase 3.2)'
+        version='AudiobookMakerPy 2.0 (Phase 3.3)'
     )
     
     args = parser.parse_args()
@@ -898,6 +1158,24 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
     # Apply quality preset to bitrate if not using custom
     if args.quality != 'custom':
         args.bitrate = quality_presets[args.quality]
+    
+    # Phase 3.3: Validate cover art if provided
+    if args.cover:
+        if not os.path.exists(args.cover):
+            parser.error(f"Cover art file does not exist: {args.cover}")
+        
+        # Check file extension
+        cover_ext = os.path.splitext(args.cover)[1].lower()
+        if cover_ext not in ['.jpg', '.jpeg', '.png']:
+            parser.error(f"Cover art must be JPEG or PNG format, got: {cover_ext}")
+        
+        # Check file size (reasonable limit)
+        try:
+            cover_size = os.path.getsize(args.cover)
+            if cover_size > 10 * 1024 * 1024:  # 10MB limit
+                parser.error(f"Cover art file is too large: {cover_size // (1024*1024)}MB (max 10MB)")
+        except OSError as e:
+            parser.error(f"Cannot read cover art file: {e}")
     
     # Validate input paths exist
     for path in args.input_paths:
@@ -1236,7 +1514,7 @@ if __name__ == '__main__':
     # Setup logging with quiet mode support
     setup_logging(quiet=args.quiet)
     
-    print("AudiobookMakerPy v2.0 - Phase 3.2 (Flexible Output Control)")
+    print("AudiobookMakerPy v2.0 - Phase 3.3 (Smart Metadata Extraction)")
     print("=" * 50)
     
     # Initialize progress tracking and timer
@@ -1294,17 +1572,32 @@ if __name__ == '__main__':
         logging.error(f"Validation error: {str(e)}")
         sys.exit(1)
     
-    # Phase 3.2: Extract metadata for template system
-    print("\nExtracting metadata for output naming...")
+    # Phase 3.3: Extract comprehensive metadata for smart processing
+    print("\nExtracting comprehensive metadata for smart processing...")
     try:
-        metadata = extract_metadata_for_template(input_files)
+        # Use comprehensive extraction for Phase 3.3 features
+        comprehensive_metadata = extract_comprehensive_metadata(input_files)
+        
+        # Extract chapter titles based on user preference
+        if args.chapter_titles == 'auto':
+            chapter_titles = comprehensive_metadata.get('chapter_titles', [])
+        elif args.chapter_titles == 'filename':
+            # Force filename-based titles
+            chapter_titles = [os.path.splitext(os.path.basename(f))[0] for f in input_files]
+        else:  # generic
+            # Force generic titles
+            chapter_titles = [f"Chapter {i+1}" for i in range(len(input_files))]
         
         # Show extracted metadata if not quiet
-        if not args.quiet and metadata:
-            print(f"Detected metadata - Title: {metadata.get('title', 'N/A')}, Author: {metadata.get('author', 'N/A')}")
+        if not args.quiet:
+            print(f"Detected metadata - Title: {comprehensive_metadata.get('title', 'N/A')}, Author: {comprehensive_metadata.get('author', 'N/A')}")
+            if args.chapter_titles == 'auto' and chapter_titles:
+                print(f"Smart chapter titles: {len(chapter_titles)} extracted")
+            if args.cover:
+                print(f"Cover art: {args.cover}")
         
         # Phase 3.2: Determine output file with flexible control
-        output_file = determine_output_path(input_files, args, metadata)
+        output_file = determine_output_path(input_files, args, comprehensive_metadata)
         
         # Show user the planned output
         print(f"Output file: {output_file}")
@@ -1356,36 +1649,41 @@ if __name__ == '__main__':
             logging.error('No files were successfully processed')
             sys.exit(1)
         
-        # Add comprehensive metadata using mutagen
+        # Phase 3.3: Add comprehensive metadata using smart extraction
         if not args.quiet:
-            with progress_tracker.operation_progress("Writing metadata", show_spinner=True) as metadata_progress:
+            with progress_tracker.operation_progress("Writing enhanced metadata", show_spinner=True) as metadata_progress:
                 try:
-                    metadata_progress.update_status("Adding chapter information")
+                    if args.cover:
+                        metadata_progress.update_status("Processing cover art")
+                    metadata_progress.update_status("Adding smart chapter information")
+                    
                     add_metadata_to_audiobook(
                         output_file, 
                         input_files, 
                         file_durations,
-                        title=args.title,
-                        author=args.author
+                        metadata=comprehensive_metadata,
+                        cover_art_path=args.cover,
+                        chapter_titles=chapter_titles
                     )
-                    metadata_progress.complete("Metadata written successfully")
+                    metadata_progress.complete("Enhanced metadata written successfully")
                 except MetadataError as e:
                     all_errors.append(e)
                     metadata_progress.complete("Metadata processing failed")
-                    print(f"Warning: Metadata processing failed: {e}")
-                    logging.warning(f"Metadata processing failed but audiobook was created: {e}")
+                    print(f"Warning: Enhanced metadata processing failed: {e}")
+                    logging.warning(f"Enhanced metadata processing failed but audiobook was created: {e}")
         else:
             try:
                 add_metadata_to_audiobook(
                     output_file, 
                     input_files, 
                     file_durations,
-                    title=args.title,
-                    author=args.author
+                    metadata=comprehensive_metadata,
+                    cover_art_path=args.cover,
+                    chapter_titles=chapter_titles
                 )
             except MetadataError as e:
                 all_errors.append(e)
-                logging.warning(f"Metadata processing failed but audiobook was created: {e}")
+                logging.warning(f"Enhanced metadata processing failed but audiobook was created: {e}")
         
         # Calculate total duration for summary
         total_duration_ms = sum(file_durations)

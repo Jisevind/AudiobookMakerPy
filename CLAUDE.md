@@ -98,3 +98,18 @@ The repository includes 4 sets of test audio files in the `testfiles/` directory
    - 4.The Yattering and Jack.m4a
 
 These test files can be used to validate functionality across different audio formats and naming conventions.
+
+## Test Cover Art
+
+The repository includes test cover art images in the `testfiles/coverart/` directory:
+
+- **9780062562982.bmp** - BMP format cover art
+- **9780062562982.jpg** - JPEG format cover art  
+- **9780063095588.bmp** - BMP format cover art
+- **9780063095588.jpg** - JPEG format cover art
+- **9780241995648.jpg** - JPEG format cover art
+- **9780241995648.png** - PNG format cover art
+- **9781529046076.jpg** - JPEG format cover art
+- **9781529046076.png** - PNG format cover art
+
+These cover art files can be used to test Phase 3.3 smart metadata extraction features, particularly the `--cover` argument for embedding cover art in audiobooks. The files include both supported formats (JPEG, PNG) and unsupported formats (BMP) for validation testing.
