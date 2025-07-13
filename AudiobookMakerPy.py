@@ -52,7 +52,7 @@ if not MUTAGEN_AVAILABLE:
     sys.exit(1)
 
 # Global variables
-max_cpu_cores = 5 #os.cpu_count()  # Number of cores to use for parallel processing, use all available cores by default
+max_cpu_cores = min(5, os.cpu_count() or 1)  # Number of cores to use for parallel processing, use all available cores by default
 tempdir = None
 
 def atoi(text):
@@ -367,12 +367,14 @@ def _add_chapters_to_file(audiofile, chapters):
         logging.warning(f'Could not add chapters to file: {str(e)}')
         # Continue without chapters rather than failing completely
 
-def process_audio_files(input_files, output_file):
+def process_audio_files(input_files, output_file, bitrate="128k", cores=None):
     """Processes audio files using pydub, converts and concatenates them.
 
     Args:
         input_files (list): List of paths to input audio files.
         output_file (str): Path to output audio file.
+        bitrate (str): Bitrate for conversion (default: 128k).
+        cores (int): Number of CPU cores to use.
 
     Returns:
         list: List of durations in milliseconds for each input file.
@@ -382,31 +384,40 @@ def process_audio_files(input_files, output_file):
     tempdir = tempfile.mkdtemp()
     converted_files = []
     durations = []
+    cores_to_use = cores or max_cpu_cores
     
     try:
-        with ProcessPoolExecutor(max_workers=max_cpu_cores) as executor:
-            # Log the start of the conversion process
-            logging.info(f'Converting {len(input_files)} files using pydub')
+        print(f"\nConverting {len(input_files)} audio files...")
+        print(f"Using temporary directory: {tempdir}")
+        print(f"Using {cores_to_use} CPU cores")
+        
+        with ProcessPoolExecutor(max_workers=cores_to_use) as executor:
             # Define a list of future tasks for conversion
-            future_tasks = [executor.submit(convert_file_for_concatenation, input_file, tempdir)
+            future_tasks = [executor.submit(convert_file_for_concatenation, input_file, tempdir, bitrate)
                             for input_file in input_files]
             
-            # Collect results (temp file paths and durations)
+            # Collect results with progress indication
+            completed = 0
             for future in future_tasks:
                 temp_file_path, duration_ms = future.result()
                 converted_files.append(temp_file_path)
                 durations.append(duration_ms)
+                completed += 1
+                print(f"Converted {completed}/{len(input_files)} files")
 
+        print(f"\nConcatenating {len(converted_files)} files into audiobook...")
         # Concatenate files using optimized strategy
         _concatenate_audio_files(converted_files, output_file, tempdir)
         
+        print(f"Successfully created: {output_file}")
         return durations
 
     except (ConversionError, Exception) as e:
+        print(f"Error during processing: {str(e)}")
         logging.error(f'An error occurred during processing: {str(e)}')
         return None
 
-def setup_logging():
+def setup_logging(quiet=False):
     """
     Sets up the logging configuration for the application.
 
@@ -415,30 +426,110 @@ def setup_logging():
 
     It also generates a unique filename for the log file based on the current date and time to ensure that logs 
     from different runs of the application do not overwrite each other.
+    
+    Args:
+        quiet (bool): If True, reduces console output verbosity.
     """
     now = datetime.now()
     dt_string = now.strftime("%Y-%m-%d_%H-%M-%S")
-    logging.basicConfig(filename=f'logfile_{dt_string}.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Configure file logging
+    logging.basicConfig(
+        filename=f'logfile_{dt_string}.log', 
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    # Add console handler for user feedback (unless quiet mode)
+    if not quiet:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(message)s')
+        console_handler.setFormatter(console_formatter)
+        logging.getLogger().addHandler(console_handler)
 
 def parse_arguments():
     """
     Parses and validates command line arguments for the application.
 
-    This function expects at least one argument (excluding the script name itself), which should 
-    be a path to an input file or directory. Multiple paths can be passed. If no arguments are 
-    provided or the provided arguments are invalid, an error message is logged, usage instructions 
-    are printed to the console, and the program exits with status code 1.
+    This function uses argparse to handle command line arguments including input paths,
+    optional title, author, output file, and other options. Provides helpful usage 
+    information and validates arguments before returning them.
 
     Returns:
-        list: The list of command line arguments (excluding the script name), which are the paths 
-        to input files or directories.
+        argparse.Namespace: Parsed command line arguments.
     """
-    if len(sys.argv) < 2:
-        print("Usage: python AudiobookMakerPy.py <input_path> [<input_path2> <input_path3> ...]")
-        logging.error("Invalid number of input paths")
-        sys.exit(1)
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="AudiobookMakerPy - Convert audio files to M4B audiobook format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python AudiobookMakerPy.py /path/to/audiofiles/
+  python AudiobookMakerPy.py file1.mp3 file2.mp3 file3.mp3
+  python AudiobookMakerPy.py /path/to/files/ --title "My Book" --author "Author Name"
+  python AudiobookMakerPy.py /path/to/files/ --output /custom/path/output.m4b
+  python AudiobookMakerPy.py /path/to/files/ --bitrate 64k --cores 2
 
-    return sys.argv[1:]
+Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
+        """
+    )
+    
+    parser.add_argument(
+        'input_paths', 
+        nargs='+', 
+        help='One or more paths to audio files or directories containing audio files'
+    )
+    
+    parser.add_argument(
+        '--title', '-t',
+        help='Title for the audiobook (default: directory name or "Audiobook")'
+    )
+    
+    parser.add_argument(
+        '--author', '-a',
+        help='Author/narrator for the audiobook (default: extracted from metadata)'
+    )
+    
+    parser.add_argument(
+        '--output', '-o',
+        help='Output file path (default: auto-generated based on input)'
+    )
+    
+    parser.add_argument(
+        '--bitrate', '-b',
+        default='128k',
+        help='Audio bitrate for conversion (default: 128k)'
+    )
+    
+    parser.add_argument(
+        '--cores', '-c',
+        type=int,
+        default=min(5, os.cpu_count() or 1),
+        help=f'Number of CPU cores to use (default: {min(5, os.cpu_count() or 1)})'
+    )
+    
+    parser.add_argument(
+        '--quiet', '-q',
+        action='store_true',
+        help='Reduce output verbosity'
+    )
+    
+    parser.add_argument(
+        '--version', '-v',
+        action='version',
+        version='AudiobookMakerPy 2.0 (Phase 4)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate input paths exist
+    for path in args.input_paths:
+        if not os.path.exists(path):
+            parser.error(f"Input path does not exist: {path}")
+    
+    return args
 
 def validate_and_get_input_files(input_paths):
     """
@@ -450,9 +541,6 @@ def validate_and_get_input_files(input_paths):
     list of input files, given it has a valid audio extension. The function then sorts the list of input 
     files using a natural key sorting algorithm.
 
-    If a provided path is neither a directory nor a file, or does not have a valid audio extension, 
-    the function prints an error message and the program exits with status code 1.
-
     Args:
         input_paths (list): A list of paths to directories or files.
 
@@ -460,24 +548,51 @@ def validate_and_get_input_files(input_paths):
         list: A sorted list of valid audio files from the provided paths.
 
     Raises:
-        SystemExit: If a path is neither a directory nor a file, or if a file does not have a valid audio extension.
+        SystemExit: If no valid audio files are found or paths are invalid.
     """
     input_files = []
+    supported_extensions = ('.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac', '.m4b')
+    
+    print(f"Scanning {len(input_paths)} input path(s)...")
+    
     for input_path in input_paths:
         if os.path.isdir(input_path):
-            folder_path = input_path
-            folder_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(('.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac', '.m4b'))]
+            folder_files = [
+                os.path.join(input_path, f) 
+                for f in os.listdir(input_path) 
+                if f.lower().endswith(supported_extensions)
+            ]
             input_files.extend(folder_files)
+            print(f"Found {len(folder_files)} audio files in directory: {input_path}")
+            
         elif os.path.isfile(input_path):
-            input_files.append(input_path)
+            if input_path.lower().endswith(supported_extensions):
+                input_files.append(input_path)
+                print(f"Added audio file: {os.path.basename(input_path)}")
+            else:
+                print(f"Warning: Skipping unsupported file format: {input_path}")
+                print(f"   Supported formats: {', '.join(supported_extensions)}")
         else:
-            print(f"Invalid input path: {input_path}")
+            print(f"Error: Path does not exist: {input_path}")
             sys.exit(1)
 
+    if not input_files:
+        print("Error: No valid audio files found in the specified paths")
+        print(f"   Supported formats: {', '.join(supported_extensions)}")
+        sys.exit(1)
+
     input_files.sort(key=natural_keys)
+    print(f"Total audio files to process: {len(input_files)}")
+    
+    # Show file list if not too many
+    if len(input_files) <= 10:
+        print("Files to process:")
+        for i, file in enumerate(input_files, 1):
+            print(f"   {i:2d}. {os.path.basename(file)}")
+    
     return input_files
 
-def get_output_file(input_files):
+def get_output_file(input_files, custom_output=None):
     """
     Generates the output file path based on the first file in the list of input files.
 
@@ -487,10 +602,17 @@ def get_output_file(input_files):
 
     Args:
         input_files (list): A list of file paths to the input audio files.
+        custom_output (str, optional): Custom output file path specified by user.
 
     Returns:
         str: The output file path for the audiobook.
     """
+    if custom_output:
+        # Ensure custom output has .m4b extension
+        if not custom_output.lower().endswith('.m4b'):
+            custom_output += '.m4b'
+        return custom_output
+    
     folder_path = os.path.dirname(input_files[0])
     parent_path = os.path.dirname(folder_path)
     output_name = os.path.basename(folder_path) + '.m4b'
@@ -714,27 +836,82 @@ def cleanup_tempdir():
     shutil.rmtree(tempdir)
 
 if __name__ == '__main__':
-    setup_logging()
+    # Parse command line arguments first
+    args = parse_arguments()
+    
+    # Setup logging with quiet mode support
+    setup_logging(quiet=args.quiet)
+    
+    print("AudiobookMakerPy v2.0 - Phase 4")
+    print("=" * 50)
     
     # Check dependencies first
+    print("Checking dependencies...")
     check_ffmpeg_dependency()
-
-    input_paths = parse_arguments()
-    input_files = validate_and_get_input_files(input_paths)
-    output_file = get_output_file(input_files)
-
-    # Process files and get durations (no longer using MP4Box)
-    file_durations = process_audio_files(input_files, output_file)
+    print("FFmpeg dependency check passed")
     
-    if file_durations is None:
-        logging.error('Processing failed - exiting')
+    # Validate and collect input files
+    input_files = validate_and_get_input_files(args.input_paths)
+    
+    # Determine output file
+    output_file = get_output_file(input_files, args.output)
+    print(f"Output file: {output_file}")
+    
+    # Check if output file already exists
+    if os.path.exists(output_file):
+        print(f"Warning: Output file already exists: {output_file}")
+        response = input("Do you want to overwrite it? (y/N): ").strip().lower()
+        if response != 'y' and response != 'yes':
+            print("Operation cancelled by user")
+            sys.exit(0)
+    
+    try:
+        # Process files and get durations
+        file_durations = process_audio_files(
+            input_files, 
+            output_file, 
+            bitrate=args.bitrate,
+            cores=args.cores
+        )
+        
+        if file_durations is None:
+            print("Processing failed - exiting")
+            logging.error('Processing failed - exiting')
+            sys.exit(1)
+        
+        # Add comprehensive metadata using mutagen
+        print(f"\nAdding metadata and chapters...")
+        add_metadata_to_audiobook(
+            output_file, 
+            input_files, 
+            file_durations,
+            title=args.title,
+            author=args.author
+        )
+        
+        # Calculate total duration for summary
+        total_duration_ms = sum(file_durations)
+        total_hours = total_duration_ms // (1000 * 60 * 60)
+        total_minutes = (total_duration_ms % (1000 * 60 * 60)) // (1000 * 60)
+        
+        print(f"\nAudiobook creation complete!")
+        print(f"Summary:")
+        print(f"   - Files processed: {len(input_files)}")
+        print(f"   - Total duration: {total_hours}h {total_minutes}m")
+        print(f"   - Output: {output_file}")
+        print(f"   - Bitrate: {args.bitrate}")
+        
+        logging.info('Audiobook creation complete.')
+        
+    except KeyboardInterrupt:
+        print(f"\nOperation cancelled by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\nUnexpected error: {str(e)}")
+        logging.error(f'Unexpected error: {str(e)}')
         sys.exit(1)
-    
-    # Add comprehensive metadata using mutagen
-    add_metadata_to_audiobook(output_file, input_files, file_durations)
-
-    cleanup_tempdir()
-    
-    logging.info('Audiobook creation complete.')
-
-    logging.info('Audiobook creation complete.')
+    finally:
+        # Always cleanup temp directory
+        if tempdir and os.path.exists(tempdir):
+            cleanup_tempdir()
+            print("Cleaned up temporary files")
