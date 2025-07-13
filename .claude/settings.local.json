@@ -9,7 +9,8 @@
       "Bash(echo:*)",
       "Bash(timeout 120 cmd /c \"while not exist testfiles\\testfiles.m4b (timeout /t 5 >nul) && echo Processing complete.\")",
       "Bash(ls:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(del testfiles.m4b)"
     ],
     "deny": []
   },
