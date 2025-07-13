@@ -55,7 +55,45 @@ if not MUTAGEN_AVAILABLE:
     raise DependencyError("mutagen", "mutagen is required for metadata handling")
 
 # Global variables
-max_cpu_cores = min(5, os.cpu_count() or 1)  # Number of cores to use for parallel processing, use all available cores by default
+# Phase 4.2: Adaptive Parallelism - Safe default per Gemini's insights
+# Use cpu_count - 1 with a cap of 8 to prevent system unresponsiveness
+def get_safe_cpu_default():
+    """Calculate safe default CPU core count following Gemini's recommendations."""
+    total_cores = os.cpu_count() or 1
+    if total_cores == 1:
+        return 1
+    # Leave one core for OS and other applications, cap at 8 for reasonable resource usage
+    return min(8, total_cores - 1)
+
+def load_user_cpu_preference():
+    """
+    Load user's CPU core preference from simple config file.
+    
+    Phase 4.2: Simple configuration per Gemini's practical approach.
+    Checks for .audiobookmaker_config.json in user's home directory.
+    Falls back to safe default if no config found.
+    """
+    config_path = os.path.expanduser("~/.audiobookmaker_config.json")
+    
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                user_cores = config.get('max_cpu_cores')
+                if user_cores and isinstance(user_cores, int) and 1 <= user_cores <= 32:
+                    logging.info(f"Using user-configured CPU cores from {config_path}: {user_cores}")
+                    return user_cores
+                else:
+                    logging.warning(f"Invalid max_cpu_cores in {config_path}: {user_cores}, using safe default")
+    except Exception as e:
+        logging.warning(f"Could not read config from {config_path}: {e}, using safe default")
+    
+    # Fall back to safe default
+    safe_default = get_safe_cpu_default()
+    logging.info(f"Using safe CPU default: {safe_default}")
+    return safe_default
+
+max_cpu_cores = load_user_cpu_preference()  # User preference or safe default: cpu_count - 1, capped at 8
 tempdir = None
 
 def cleanup_temp_files(temp_directory):
@@ -1234,6 +1272,10 @@ Phase 3.4 - Resume Functionality:
   python AudiobookMakerPy.py /path/to/files/ --resume never  # Always start fresh
   python AudiobookMakerPy.py /path/to/files/ --resume force  # Fail if cannot resume
 
+Phase 4.2 - Adaptive Parallelism Configuration:
+  Create ~/.audiobookmaker_config.json with: {"max_cpu_cores": 4}
+  Command-line --cores argument always overrides config file setting
+
 Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         """
     )
@@ -1268,8 +1310,11 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
     parser.add_argument(
         '--cores', '-c',
         type=int,
-        default=min(5, os.cpu_count() or 1),
-        help=f'Number of CPU cores to use (default: {min(5, os.cpu_count() or 1)})'
+        default=max_cpu_cores,
+        help=f'Number of CPU cores to use for parallel processing. '
+             f'Default: {max_cpu_cores} '
+             f'(configurable via ~/.audiobookmaker_config.json, '
+             f'safe default: {get_safe_cpu_default()} cores)'
     )
     
     parser.add_argument(
