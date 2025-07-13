@@ -20,6 +20,10 @@ from validation import (
     AudioFileValidator, ValidationLevel, ValidationSummary,
     validate_audio_files, validate_with_pydub_preflight
 )
+from resource_manager import (
+    managed_processing, managed_temp_directory, 
+    get_signal_handler, get_timeout_manager
+)
 
 # Audio processing imports
 try:
@@ -48,6 +52,15 @@ if not MUTAGEN_AVAILABLE:
 # Global variables
 max_cpu_cores = min(5, os.cpu_count() or 1)  # Number of cores to use for parallel processing, use all available cores by default
 tempdir = None
+
+def cleanup_temp_files(temp_directory):
+    """Cleanup function for signal handler."""
+    if temp_directory and os.path.exists(temp_directory):
+        try:
+            shutil.rmtree(temp_directory)
+            logging.info(f"Emergency cleanup completed: {temp_directory}")
+        except Exception as e:
+            logging.error(f"Failed emergency cleanup: {e}")
 
 def atoi(text):
     """Converts a digit string to an integer, otherwise returns the original string"""
@@ -364,7 +377,13 @@ def _add_chapters_to_file(audiofile, chapters):
         # Continue without chapters rather than failing completely
 
 def process_audio_files(input_files, output_file, bitrate="128k", cores=None):
-    """Processes audio files using pydub, converts and concatenates them with enhanced error handling.
+    """Processes audio files with comprehensive resource management.
+
+    This function implements Phase 2.4 resource management including:
+    - Memory usage monitoring and limits
+    - Disk space verification
+    - Guaranteed cleanup of temporary files
+    - Signal handling for graceful shutdown
 
     Args:
         input_files (list): List of paths to input audio files.
@@ -376,80 +395,101 @@ def process_audio_files(input_files, output_file, bitrate="128k", cores=None):
         tuple: (durations_list, errors_list) - Successfully processed durations and any errors encountered.
     """
     global tempdir
-
-    tempdir = tempfile.mkdtemp()
-    converted_files = []
-    durations = []
-    processing_errors = []
-    cores_to_use = cores or max_cpu_cores
     
-    try:
-        print(f"\nConverting {len(input_files)} audio files...")
-        print(f"Using temporary directory: {tempdir}")
-        print(f"Using {cores_to_use} CPU cores")
+    # Use managed processing context for comprehensive resource management
+    with managed_processing(input_files, monitor_resources=True) as context:
+        tempdir = context['temp_dir']
+        resource_monitor = context['resource_monitor']
+        requirements = context['requirements']
         
-        with ProcessPoolExecutor(max_workers=cores_to_use) as executor:
-            # Create tasks with error handling
-            future_to_file = {
-                executor.submit(convert_file_for_concatenation, input_file, tempdir, bitrate): input_file
-                for input_file in input_files
-            }
-            
-            # Collect results with skip-and-continue logic
-            completed = 0
-            successful = 0
-            for future in future_to_file:
-                input_file = future_to_file[future]
-                try:
-                    temp_file_path, duration_ms = future.result()
-                    converted_files.append(temp_file_path)
-                    durations.append(duration_ms)
-                    successful += 1
-                    print(f"[OK] Converted {os.path.basename(input_file)}")
-                except FileProcessingError as e:
-                    processing_errors.append(e)
-                    print(f"[FAIL] Failed to convert {os.path.basename(input_file)}: {e}")
-                    logging.warning(f"Skipping file due to conversion error: {e}")
-                except Exception as e:
-                    # Wrap unexpected errors
-                    wrapped_error = ProcessingError(f"Unexpected error: {str(e)}", "conversion", recoverable=False)
-                    processing_errors.append(wrapped_error)
-                    print(f"[ERROR] Unexpected error with {os.path.basename(input_file)}: {e}")
-                    logging.error(f"Unexpected error during conversion: {e}")
-                
-                completed += 1
-                print(f"Progress: {completed}/{len(input_files)} files processed ({successful} successful)")
-
-        # Only proceed with concatenation if we have some successful conversions
-        if not converted_files:
-            raise ProcessingError("No files were successfully converted", "conversion", recoverable=False)
-        elif len(converted_files) < len(input_files):
-            print(f"\nWarning: Only {len(converted_files)}/{len(input_files)} files converted successfully")
-            print("Proceeding with available files...")
-
-        print(f"\nConcatenating {len(converted_files)} files into audiobook...")
+        converted_files = []
+        durations = []
+        processing_errors = []
+        cores_to_use = cores or max_cpu_cores
+        
+        # Register cleanup callback with signal handler
+        signal_handler = get_signal_handler()
+        signal_handler.add_cleanup_callback(lambda: cleanup_temp_files(tempdir))
+        
         try:
-            _concatenate_audio_files(converted_files, output_file, tempdir)
-            print(f"Successfully created: {output_file}")
-        except ConcatenationError as e:
-            processing_errors.append(e)
-            raise  # Re-raise concatenation errors as they're fatal
-        
-        return durations, processing_errors
+            print(f"\nConverting {len(input_files)} audio files...")
+            print(f"Using temporary directory: {tempdir}")
+            print(f"Using {cores_to_use} CPU cores")
+            print(f"Estimated memory usage: {requirements['estimated_memory_mb']}MB")
+            print(f"Estimated temp space: {requirements['estimated_temp_space_mb']}MB")
+            
+            with ProcessPoolExecutor(max_workers=cores_to_use) as executor:
+                # Create tasks with error handling
+                future_to_file = {
+                    executor.submit(convert_file_for_concatenation, input_file, tempdir, bitrate): input_file
+                    for input_file in input_files
+                }
+                
+                # Collect results with skip-and-continue logic
+                completed = 0
+                successful = 0
+                for future in future_to_file:
+                    input_file = future_to_file[future]
+                    
+                    # Check for shutdown signal
+                    if signal_handler.check_shutdown_requested():
+                        print("\nShutdown requested, cancelling remaining tasks...")
+                        break
+                    
+                    # Check memory usage periodically
+                    if completed % 5 == 0:  # Check every 5 files
+                        resource_monitor.check_memory_limit()
+                    
+                    try:
+                        temp_file_path, duration_ms = future.result()
+                        converted_files.append(temp_file_path)
+                        durations.append(duration_ms)
+                        successful += 1
+                        print(f"[OK] Converted {os.path.basename(input_file)}")
+                    except FileProcessingError as e:
+                        processing_errors.append(e)
+                        print(f"[FAIL] Failed to convert {os.path.basename(input_file)}: {e}")
+                        logging.warning(f"Skipping file due to conversion error: {e}")
+                    except Exception as e:
+                        # Wrap unexpected errors
+                        wrapped_error = ProcessingError(f"Unexpected error: {str(e)}", "conversion", recoverable=False)
+                        processing_errors.append(wrapped_error)
+                        print(f"[ERROR] Unexpected error with {os.path.basename(input_file)}: {e}")
+                        logging.error(f"Unexpected error during conversion: {e}")
+                    
+                    completed += 1
+                    print(f"Progress: {completed}/{len(input_files)} files processed ({successful} successful)")
 
-    except (DependencyError, ResourceError, ConfigurationError) as e:
-        # Fatal errors that prevent continuation
-        processing_errors.append(e)
-        print(f"Fatal error: {e.get_user_message()}")
-        logging.error(f'Fatal error during processing: {str(e)}')
-        raise
-    except Exception as e:
-        # Wrap other unexpected errors
-        wrapped_error = ProcessingError(f"Unexpected processing error: {str(e)}", "processing", recoverable=False)
-        processing_errors.append(wrapped_error)
-        print(f"Unexpected error during processing: {str(e)}")
-        logging.error(f'Unexpected error during processing: {str(e)}')
-        raise wrapped_error
+            # Only proceed with concatenation if we have some successful conversions
+            if not converted_files:
+                raise ProcessingError("No files were successfully converted", "conversion", recoverable=False)
+            elif len(converted_files) < len(input_files):
+                print(f"\nWarning: Only {len(converted_files)}/{len(input_files)} files converted successfully")
+                print("Proceeding with available files...")
+
+            print(f"\nConcatenating {len(converted_files)} files into audiobook...")
+            try:
+                _concatenate_audio_files(converted_files, output_file, tempdir)
+                print(f"Successfully created: {output_file}")
+            except ConcatenationError as e:
+                processing_errors.append(e)
+                raise  # Re-raise concatenation errors as they're fatal
+            
+            return durations, processing_errors
+        
+        except (DependencyError, ResourceError, ConfigurationError) as e:
+            # Fatal errors that prevent continuation
+            processing_errors.append(e)
+            print(f"Fatal error: {e.get_user_message()}")
+            logging.error(f'Fatal error during processing: {str(e)}')
+            raise
+        except Exception as e:
+            # Wrap other unexpected errors
+            wrapped_error = ProcessingError(f"Unexpected processing error: {str(e)}", "processing", recoverable=False)
+            processing_errors.append(wrapped_error)
+            print(f"Unexpected error during processing: {str(e)}")
+            logging.error(f'Unexpected error during processing: {str(e)}')
+            raise
 
 def setup_logging(quiet=False):
     """
@@ -560,7 +600,7 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
     parser.add_argument(
         '--version', '-v',
         action='version',
-        version='AudiobookMakerPy 2.0 (Phase 2.2)'
+        version='AudiobookMakerPy 2.0 (Phase 2.4)'
     )
     
     args = parser.parse_args()
@@ -781,7 +821,11 @@ def get_audio_duration_fallback(input_file):
 
 def _concatenate_audio_files(converted_files, output_file, temp_dir):
     """
-    Concatenates audio files using the best available method.
+    Concatenates audio files using FFmpeg for memory efficiency.
+    
+    Per Gemini's analysis: pydub concatenation loads all files into memory simultaneously,
+    which can require 6GB+ RAM for large audiobooks. FFmpeg's concat demuxer is much more
+    memory efficient as it streams files directly from disk.
     
     Args:
         converted_files (list): List of temporary converted file paths.
@@ -792,18 +836,22 @@ def _concatenate_audio_files(converted_files, output_file, temp_dir):
         ConversionError: If concatenation fails.
     """
     try:
-        if PYDUB_AVAILABLE:
-            _concatenate_with_pydub(converted_files, output_file)
-        else:
-            _concatenate_with_ffmpeg(converted_files, output_file, temp_dir)
+        # Always use FFmpeg for concatenation to avoid memory issues
+        # This implements Gemini's "streaming concatenation strategy"
+        _concatenate_with_ffmpeg(converted_files, output_file, temp_dir)
     except Exception as e:
         logging.error(f'Concatenation failed: {str(e)}')
         raise ConcatenationError(f"Audio concatenation failed: {str(e)}") from e
 
 def _concatenate_with_pydub(converted_files, output_file):
     """
-    Concatenates audio files using pydub (when available).
+    Concatenates audio files using pydub.
+    
+    WARNING: This method loads all files into memory simultaneously and can consume
+    6GB+ RAM for large audiobooks. Use _concatenate_with_ffmpeg for production.
+    Kept for potential future optimizations with chunked processing.
     """
+    logging.warning(f'Using memory-intensive pydub concatenation for {len(converted_files)} files')
     logging.info(f'Concatenating {len(converted_files)} files using pydub')
     
     # Load first file to establish format
@@ -894,7 +942,7 @@ if __name__ == '__main__':
     # Setup logging with quiet mode support
     setup_logging(quiet=args.quiet)
     
-    print("AudiobookMakerPy v2.0 - Phase 2.2 (Input Validation)")
+    print("AudiobookMakerPy v2.0 - Phase 2.4 (Resource Management)")
     print("=" * 50)
     
     # Validate and collect input files
