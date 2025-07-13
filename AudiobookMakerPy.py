@@ -16,6 +16,10 @@ from exceptions import (
     ProcessingError, ConcatenationError, InterruptedError,
     classify_error, get_error_summary
 )
+from validation import (
+    AudioFileValidator, ValidationLevel, ValidationSummary,
+    validate_audio_files, validate_with_pydub_preflight
+)
 
 # Audio processing imports
 try:
@@ -547,9 +551,16 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
     )
     
     parser.add_argument(
+        '--validation-level', '--val',
+        choices=['lax', 'normal', 'strict', 'paranoid'],
+        default='normal',
+        help='Validation strictness level (default: normal)'
+    )
+    
+    parser.add_argument(
         '--version', '-v',
         action='version',
-        version='AudiobookMakerPy 2.0 (Phase 4)'
+        version='AudiobookMakerPy 2.0 (Phase 2.2)'
     )
     
     args = parser.parse_args()
@@ -883,11 +894,46 @@ if __name__ == '__main__':
     # Setup logging with quiet mode support
     setup_logging(quiet=args.quiet)
     
-    print("AudiobookMakerPy v2.0 - Phase 2.1 (Enhanced Error Handling)")
+    print("AudiobookMakerPy v2.0 - Phase 2.2 (Input Validation)")
     print("=" * 50)
     
     # Validate and collect input files
     input_files = validate_and_get_input_files(args.input_paths)
+    
+    # Pre-flight validation as suggested by Gemini's pydub insights
+    print(f"\nPerforming pre-flight validation ({args.validation_level} mode)...")
+    validation_level = ValidationLevel(args.validation_level)
+    
+    try:
+        valid_files, validation_report = validate_audio_files(input_files, validation_level)
+        
+        if len(valid_files) != len(input_files):
+            print("\n" + "=" * 50)
+            print("VALIDATION REPORT")
+            print("=" * 50)
+            print(validation_report)
+            print("=" * 50)
+            
+            if not valid_files:
+                print("ERROR: No valid audio files found. Processing cannot continue.")
+                sys.exit(1)
+            
+            print(f"WARNING: Only {len(valid_files)}/{len(input_files)} files passed validation.")
+            response = input("Continue with valid files only? (y/N): ").strip().lower()
+            if response != 'y' and response != 'yes':
+                print("Operation cancelled by user")
+                sys.exit(0)
+            
+            # Update input_files to only include valid files
+            input_files = valid_files
+            
+        else:
+            print(f"[OK] All {len(input_files)} files passed validation")
+            
+    except Exception as e:
+        print(f"[ERROR] Pre-flight validation failed: {str(e)}")
+        logging.error(f"Validation error: {str(e)}")
+        sys.exit(1)
     
     # Determine output file
     output_file = get_output_file(input_files, args.output)
