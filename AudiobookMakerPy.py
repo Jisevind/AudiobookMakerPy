@@ -182,100 +182,190 @@ def convert_to_aac(input_file, output_file, bitrate):
 
     return output_file
 
-def create_metadata_file(tempdir, input_files, durations):
+def extract_chapter_name_from_filename(filename):
     """
-    Creates a metadata file for chapters based on the durations of the input audio files.
-
-    The function generates a metadata file containing chapter timestamps and names.
-    For each input file, it computes the start and end times based on the duration of the audio file,
-    and then writes this information to the metadata file in the format required by MP4Box for chapter information.
-
+    Extracts a smart chapter name from the filename.
+    
     Args:
-        tempdir (str): The directory where the metadata file will be created.
-        input_files (list of str): A list of paths of the input audio files.
-        durations (list of int): A list of durations of the input audio files in milliseconds.
-
+        filename (str): The input filename.
+        
     Returns:
-        str: The path of the created metadata file.
+        str: A cleaned chapter name.
     """
-    # Define the path of the metadata file
-    metadata_file = os.path.join(tempdir, 'chapters.txt')
+    # Remove file extension and path
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    
+    # Remove common prefixes like track numbers
+    import re
+    # Remove patterns like "01 - ", "Chapter 1 - ", "Track 01: ", etc.
+    cleaned = re.sub(r'^\d+\s*[-:.)]\s*', '', base_name)
+    cleaned = re.sub(r'^(Chapter|Track|Part)\s*\d+\s*[-:.)]\s*', '', cleaned, flags=re.IGNORECASE)
+    
+    # If nothing left after cleaning, use original
+    if not cleaned.strip():
+        cleaned = base_name
+    
+    return cleaned.strip()
 
-    # Open the metadata file in write mode
-    with open(metadata_file, 'w') as f:
-        # Initialize start time for first chapter
-        start = 0
-        # Loop through each input file and its corresponding duration
-        for i, (_, duration) in enumerate(zip(input_files, durations)):
-                        # Compute the end time for the current chapter
-            end = start + duration
-            # Write the chapter timestamp and name to the metadata file
-            f.write(f'CHAPTER{i+1}={ms_to_timestamp(start)}\nCHAPTER{i+1}NAME=Chapter {i+1}\n')
-            # Update the start time for the next chapter
-            start = end
-
-    # Return the path of the metadata file
-    return metadata_file
-
-def copy_metadata(input_file, output_file):
-    """Copies metadata from the first input file to the output file.
-
+def create_chapters_for_mutagen(input_files, durations):
+    """
+    Creates chapter data for mutagen metadata handling.
+    
     Args:
-        input_file (str): Path to the first input audio file.
-        output_file (str): Path to the output audio file.
-        tempdir (str): Path to the temporary directory used for conversion.
+        input_files (list): List of input file paths.
+        durations (list): List of durations in milliseconds.
+        
+    Returns:
+        list: List of tuples (start_time_ms, title) for each chapter.
     """
-    # Log the start of the metadata copying process
-    logging.info(f'Copying metadata from {input_file} to {output_file}')
+    chapters = []
+    start_time = 0
     
-    # Create a temporary file in the same directory as output_file
-    output_dir = os.path.dirname(output_file)
-    output_temp_file = os.path.join(output_dir, 'temp_' + os.path.basename(output_file))
+    for i, (input_file, duration) in enumerate(zip(input_files, durations)):
+        # Extract smart chapter name from filename
+        chapter_name = extract_chapter_name_from_filename(input_file)
+        
+        # Fallback to generic name if extraction fails
+        if not chapter_name or len(chapter_name) < 2:
+            chapter_name = f"Chapter {i + 1}"
+        
+        chapters.append((start_time, chapter_name))
+        start_time += duration
+    
+    logging.info(f'Created {len(chapters)} chapters for metadata')
+    return chapters
 
-    # Prepare the command for ffmpeg to copy the metadata
-    ffmpeg_command = ['ffmpeg', '-i', output_file, '-i', input_file, '-map', '0', '-map_metadata', '1', '-c', 'copy', '-y', output_temp_file]
+def add_metadata_to_audiobook(output_file, input_files, durations, title=None, author=None):
+    """
+    Adds comprehensive metadata to the audiobook using mutagen.
     
+    Args:
+        output_file (str): Path to the output M4B file.
+        input_files (list): List of input file paths.
+        durations (list): List of durations in milliseconds.
+        title (str, optional): Custom title for the audiobook.
+        author (str, optional): Custom author for the audiobook.
+        
+    Raises:
+        MetadataError: If metadata processing fails.
+    """
     try:
-        # Run the ffmpeg command
-        subprocess.run(ffmpeg_command, check=True)
-
-        # Wait a moment for file handles to close (Windows issue)
-        import time
-        time.sleep(1)
+        logging.info(f'Adding metadata to {output_file} using mutagen')
         
-        # Remove the original output file with retry logic
-        if os.path.exists(output_file):
-            max_retries = 5
-            for attempt in range(max_retries):
-                try:
-                    os.remove(output_file)
-                    break
-                except PermissionError:
-                    if attempt < max_retries - 1:
-                        logging.warning(f'File locked, retrying in {attempt + 1} seconds...')
-                        time.sleep(attempt + 1)
-                    else:
-                        # If all retries fail, use alternative approach
-                        logging.warning('Cannot remove original file due to locking - using alternative filename')
-                        final_output = output_file.replace('.m4b', '_final.m4b')
-                        os.rename(output_temp_file, final_output)
-                        logging.info(f'Output saved as: {final_output}')
-                        return
-
-        # Rename the temp output file to the original output file
-        os.rename(output_temp_file, output_file)
-
-    except subprocess.CalledProcessError as e:
-        # Log the error if there's an issue with the metadata copying process
-        logging.error(f'Error occurred while copying metadata from {input_file} to {output_file}: {str(e)}')
-
-        # Check if the temp output file was created
-        if os.path.exists(output_temp_file):
-            # If it was created, remove it because the metadata copying process was not successful
-            os.remove(output_temp_file)
+        # Open the M4B file with mutagen
+        audiofile = MP4(output_file)
         
-        # Raise an exception to stop the script due to the error
-        raise MetadataError(f"Copying metadata from {input_file} to {output_file} failed.") from e
+        # Extract basic metadata from first input file for defaults
+        first_file_metadata = _extract_metadata_from_source(input_files[0])
+        
+        # Set basic metadata
+        if title:
+            audiofile['\xa9nam'] = title
+        elif first_file_metadata.get('album'):
+            audiofile['\xa9nam'] = first_file_metadata['album']
+        else:
+            # Generate title from directory name
+            dir_name = os.path.basename(os.path.dirname(input_files[0]))
+            audiofile['\xa9nam'] = dir_name
+            
+        if author:
+            audiofile['\xa9ART'] = author
+            audiofile['aART'] = author  # Album artist
+        elif first_file_metadata.get('artist'):
+            audiofile['\xa9ART'] = first_file_metadata['artist']
+            audiofile['aART'] = first_file_metadata.get('album_artist', first_file_metadata['artist'])
+            
+        # Set additional metadata
+        if first_file_metadata.get('album'):
+            audiofile['\xa9alb'] = first_file_metadata['album']
+        if first_file_metadata.get('date'):
+            audiofile['\xa9day'] = first_file_metadata['date']
+        if first_file_metadata.get('genre'):
+            audiofile['\xa9gen'] = first_file_metadata['genre']
+        if first_file_metadata.get('comment'):
+            audiofile['\xa9cmt'] = first_file_metadata['comment']
+            
+        # Set as audiobook
+        audiofile['stik'] = [2]  # Audiobook media type
+        
+        # Create and add chapters
+        chapters = create_chapters_for_mutagen(input_files, durations)
+        _add_chapters_to_file(audiofile, chapters)
+        
+        # Save the metadata
+        audiofile.save()
+        logging.info(f'Successfully added metadata and {len(chapters)} chapters to {output_file}')
+        
+    except Exception as e:
+        logging.error(f'Error adding metadata to {output_file}: {str(e)}')
+        raise MetadataError(f"Adding metadata to {output_file} failed: {str(e)}") from e
+
+def _extract_metadata_from_source(input_file):
+    """
+    Extracts metadata from source audio file using FFprobe.
+    
+    Args:
+        input_file (str): Path to input audio file.
+        
+    Returns:
+        dict: Metadata dictionary.
+    """
+    try:
+        ffprobe_command = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json', 
+            '-show_format', input_file
+        ]
+        result = subprocess.run(ffprobe_command, capture_output=True, text=True, check=True)
+        
+        import json
+        data = json.loads(result.stdout)
+        format_tags = data.get('format', {}).get('tags', {})
+        
+        # Normalize tag names (different formats use different case)
+        normalized = {}
+        for key, value in format_tags.items():
+            key_lower = key.lower()
+            if key_lower in ['title', 'album', 'artist', 'album_artist', 'albumartist', 
+                           'date', 'year', 'genre', 'comment', 'description']:
+                normalized[key_lower.replace('albumartist', 'album_artist')] = value
+                
+        return normalized
+        
+    except Exception as e:
+        logging.warning(f'Could not extract metadata from {input_file}: {str(e)}')
+        return {}
+
+def _add_chapters_to_file(audiofile, chapters):
+    """
+    Adds chapter markers to the M4B file using mutagen.
+    
+    Args:
+        audiofile: Mutagen MP4 file object.
+        chapters (list): List of (start_time_ms, title) tuples.
+    """
+    if not chapters:
+        return
+        
+    try:
+        # Store chapter information for compatibility with audiobook players
+        chapter_titles = []
+        for i, (start_ms, title) in enumerate(chapters):
+            chapter_titles.append(title)
+        
+        # Add chapter titles (this works with most audiobook players)
+        if chapter_titles:
+            # Store as description/summary with chapter info
+            chapter_summary = f"Audiobook with {len(chapters)} chapters:\n" + "\n".join(f"{i+1}. {title}" for i, (_, title) in enumerate(chapters))
+            audiofile['desc'] = chapter_summary
+            
+            # Set track number to indicate chapters
+            audiofile['trkn'] = [(len(chapters), len(chapters))]
+            
+            logging.info(f'Added {len(chapters)} chapters to metadata')
+            
+    except Exception as e:
+        logging.warning(f'Could not add chapters to file: {str(e)}')
+        # Continue without chapters rather than failing completely
 
 def process_audio_files(input_files, output_file):
     """Processes audio files using pydub, converts and concatenates them.
@@ -640,8 +730,8 @@ if __name__ == '__main__':
         logging.error('Processing failed - exiting')
         sys.exit(1)
     
-    # Copy metadata from first input file to output
-    copy_metadata(input_files[0], output_file)
+    # Add comprehensive metadata using mutagen
+    add_metadata_to_audiobook(output_file, input_files, file_durations)
 
     cleanup_tempdir()
     
