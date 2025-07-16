@@ -25,7 +25,10 @@
       "Bash(npm run tauri:*)",
       "Bash(start /wait:*)",
       "WebFetch(domain:docs.anthropic.com)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(cp:*)",
+      "Bash(chmod:*)",
+      "Bash(find:*)"
     ],
     "deny": []
   }

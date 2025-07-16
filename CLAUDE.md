@@ -16,8 +16,7 @@ AudiobookMakerPy.bat
 ### Dependencies
 This project requires external dependencies that must be installed separately:
 - **Python 3.x** - Core runtime
-- **FFmpeg** - Audio processing and metadata extraction
-- **MP4Box (GPAC)** - Audio concatenation and chapter creation
+- **FFmpeg** - Audio processing, metadata extraction, and concatenation
 
 No Python package dependencies are used - the script relies only on standard library modules.
 
@@ -59,7 +58,7 @@ No Python package dependencies are used - the script relies only on standard lib
 2. Extract audio properties and durations from all input files
 3. Convert all files to AAC format in parallel using all CPU cores
 4. Create chapter metadata file with timestamps
-5. Concatenate converted files using MP4Box with chapter information
+5. Concatenate converted files using FFmpeg with chapter information
 6. Copy metadata from first input file to final output
 7. Clean up temporary directory
 

@@ -1,0 +1,129 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audiobookmaker"
+version = "2.0.0"
+description = "Convert audio files to M4B audiobook format with smart metadata extraction"
+authors = [
+    {name = "AudiobookMakerPy Project", email = "contact@audiobookmaker.py"}
+]
+maintainers = [
+    {name = "AudiobookMakerPy Project", email = "contact@audiobookmaker.py"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Conversion",
+    "Topic :: System :: Archiving :: Backup",
+]
+keywords = ["audiobook", "m4b", "audio", "conversion", "metadata", "chapters"]
+dependencies = [
+    # Core dependencies are external tools (FFmpeg, MP4Box)
+    # Python dependencies are optional for enhanced features
+]
+
+[project.optional-dependencies]
+enhanced = [
+    "mutagen>=1.45.0",  # Enhanced metadata support
+    "pydub>=0.25.0",    # Alternative audio processing
+]
+dev = [
+    "pytest>=6.0.0",
+    "pytest-cov>=2.10.0",
+    "black>=21.0.0",
+    "isort>=5.0.0",
+    "flake8>=3.8.0",
+    "mypy>=0.812",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/audiobookmaker/AudiobookMakerPy"
+"Bug Reports" = "https://github.com/audiobookmaker/AudiobookMakerPy/issues"
+"Source" = "https://github.com/audiobookmaker/AudiobookMakerPy"
+
+[project.scripts]
+audiobookmaker = "audiobookmaker.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ['py37']
+include = '\\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \\.eggs
+  | \\.git
+  | \\.hg
+  | \\.mypy_cache
+  | \\.tox
+  | \\.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["audiobookmaker"]
+
+[tool.mypy]
+python_version = "3.7"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "--cov=src/audiobookmaker --cov-report=term-missing --cov-report=html"
+
+[tool.coverage.run]
+source = ["src/audiobookmaker"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
