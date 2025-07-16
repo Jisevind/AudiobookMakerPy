@@ -1,0 +1,35 @@
+{
+  "includeCoAuthoredBy": false,
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(powershell:*)",
+      "Bash(pip install:*)",
+      "Bash(pip search:*)",
+      "Bash(python:*)",
+      "Bash(echo:*)",
+      "Bash(timeout 120 cmd /c \"while not exist testfiles\\testfiles.m4b (timeout /t 5 >nul) && echo Processing complete.\")",
+      "Bash(ls:*)",
+      "Bash(rm:*)",
+      "Bash(del testfiles.m4b)",
+      "Bash(timeout:*)",
+      "Bash(mkdir:*)",
+      "Bash(npm:*)",
+      "Bash(npx create-tauri-app:*)",
+      "Bash(taskkill:*)",
+      "Bash(start AudioBookMaker.exe)",
+      "Bash(grep:*)",
+      "Bash(AudioBookMaker.exe)",
+      "Bash(start /wait AudioBookMaker.exe)",
+      "Bash(npx tauri:*)",
+      "Bash(npm run tauri:*)",
+      "Bash(start /wait:*)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(cp:*)",
+      "Bash(chmod:*)",
+      "Bash(find:*)"
+    ],
+    "deny": []
+  }
+}

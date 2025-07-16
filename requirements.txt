@@ -1,0 +1,12 @@
+# AudioBookMaker Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Audio processing and manipulation
+# Note: Python 3.13+ has removed audioop module - pydub will work but may show warnings
+pydub>=0.25.1
+
+# Audio metadata handling
+mutagen>=1.47.0
+
+# Progress indicators and user experience
+tqdm>=4.65.0
