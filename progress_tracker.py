@@ -1,9 +1,5 @@
 """
 Progress tracking module for AudiobookMakerPy.
-
-This module implements Phase 3.1 progress indicators using Gemini's recommended
-approach with tqdm for reliable, user-friendly progress visualization without
-the complexity and fragility of FFmpeg stderr parsing.
 """
 
 import time

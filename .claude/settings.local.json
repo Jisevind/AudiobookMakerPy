@@ -1,4 +1,5 @@
 {
+  "includeCoAuthoredBy": false,
   "permissions": {
     "allow": [
       "Bash(dir:*)",
@@ -11,11 +12,21 @@
       "Bash(ls:*)",
       "Bash(rm:*)",
       "Bash(del testfiles.m4b)",
-      "Bash(timeout:*)"
+      "Bash(timeout:*)",
+      "Bash(mkdir:*)",
+      "Bash(npm:*)",
+      "Bash(npx create-tauri-app:*)",
+      "Bash(taskkill:*)",
+      "Bash(start AudioBookMaker.exe)",
+      "Bash(grep:*)",
+      "Bash(AudioBookMaker.exe)",
+      "Bash(start /wait AudioBookMaker.exe)",
+      "Bash(npx tauri:*)",
+      "Bash(npm run tauri:*)",
+      "Bash(start /wait:*)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:github.com)"
     ],
     "deny": []
-  },
-  "git": {
-    "includeClaudeCodeCredit": false
   }
 }

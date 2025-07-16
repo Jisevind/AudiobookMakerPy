@@ -1,9 +1,5 @@
 """
 Resource management module for AudiobookMakerPy.
-
-This module implements comprehensive resource monitoring and management as outlined
-in claude_plan.md Phase 2.4, with specific focus on memory efficiency per Gemini's
-insights about pydub memory consumption.
 """
 
 import os
@@ -236,7 +232,7 @@ class ResourceMonitor:
             'memory': memory_stats,
             'memory_limit_mb': self.memory_limit_mb,
             'monitoring_active': self._monitoring,
-            'process_id': self._process.pid
+            'process_id': self._process.pid if self._process else None
         }
 
 

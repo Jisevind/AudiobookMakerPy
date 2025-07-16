@@ -40,761 +40,226 @@ except ImportError:
     MUTAGEN_AVAILABLE = False
     print("Warning: mutagen not available. Install with: pip install mutagen")
 
-# Try to import pydub, but continue without it if it fails (Python 3.13 compatibility)
+# Global variables
+tempdir = None
+max_cpu_cores = os.cpu_count() or 4
+
+# Optional pydub import for enhanced functionality
 try:
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        from pydub import AudioSegment
+    from pydub import AudioSegment
     PYDUB_AVAILABLE = True
-    logging.info('pydub available - using for audio processing')
 except ImportError:
     PYDUB_AVAILABLE = False
-    logging.info('pydub not available - using fallback subprocess method')
-    
-if not MUTAGEN_AVAILABLE:
-    raise DependencyError("mutagen", "mutagen is required for metadata handling")
 
-# Global variables
-# Phase 4.2: Adaptive Parallelism - Safe default per Gemini's insights
-# Use cpu_count - 1 with a cap of 8 to prevent system unresponsiveness
+# Helper functions for missing dependencies
 def get_safe_cpu_default():
-    """Calculate safe default CPU core count following Gemini's recommendations."""
-    total_cores = os.cpu_count() or 1
-    if total_cores == 1:
-        return 1
-    # Leave one core for OS and other applications, cap at 8 for reasonable resource usage
-    return min(8, total_cores - 1)
+    """Returns a safe default for CPU cores."""
+    return min(4, os.cpu_count() or 2)
 
-def load_user_cpu_preference():
-    """
-    Load user's CPU core preference from simple config file.
-    
-    Phase 4.2: Simple configuration per Gemini's practical approach.
-    Checks for .audiobookmaker_config.json in user's home directory.
-    Falls back to safe default if no config found.
-    """
-    config_path = os.path.expanduser("~/.audiobookmaker_config.json")
-    
-    try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-                user_cores = config.get('max_cpu_cores')
-                if user_cores and isinstance(user_cores, int) and 1 <= user_cores <= 32:
-                    logging.info(f"Using user-configured CPU cores from {config_path}: {user_cores}")
-                    return user_cores
-                else:
-                    logging.warning(f"Invalid max_cpu_cores in {config_path}: {user_cores}, using safe default")
-    except Exception as e:
-        logging.warning(f"Could not read config from {config_path}: {e}, using safe default")
-    
-    # Fall back to safe default
-    safe_default = get_safe_cpu_default()
-    logging.info(f"Using safe CPU default: {safe_default}")
-    return safe_default
-
-max_cpu_cores = load_user_cpu_preference()  # User preference or safe default: cpu_count - 1, capped at 8
-tempdir = None
-
-def cleanup_temp_files(temp_directory):
-    """Cleanup function for signal handler."""
-    if temp_directory and os.path.exists(temp_directory):
-        try:
-            shutil.rmtree(temp_directory)
-            logging.info(f"Emergency cleanup completed: {temp_directory}")
-        except Exception as e:
-            logging.error(f"Failed emergency cleanup: {e}")
-
-def create_job_hash(input_files, output_file, bitrate="128k"):
-    """
-    Create a predictable hash for job identification and resume functionality.
-    
-    Phase 3.4: Generates consistent hash based on input files, output path, and processing parameters
-    to enable resume functionality through predictable temporary directory naming.
-    
-    Args:
-        input_files (list): List of input file paths
-        output_file (str): Path to output audiobook file
-        bitrate (str): Processing bitrate parameter
-        
-    Returns:
-        str: SHA256 hash for job identification
-    """
-    # Create deterministic string from all inputs
-    job_data = {
-        'input_files': sorted([os.path.abspath(f) for f in input_files]),  # Sort for consistency
-        'output_file': os.path.abspath(output_file),
-        'bitrate': bitrate,
-        'version': '3.4'  # Version for future compatibility
-    }
-    
-    # Convert to JSON string for hashing
-    job_string = json.dumps(job_data, sort_keys=True)
-    
-    # Create SHA256 hash
-    job_hash = hashlib.sha256(job_string.encode('utf-8')).hexdigest()[:16]  # First 16 chars for readability
-    
-    logging.debug(f"Created job hash: {job_hash} for {len(input_files)} files")
-    return job_hash
-
-def create_predictable_temp_dir(input_files, output_file, bitrate="128k"):
-    """
-    Create a predictable temporary directory for resume functionality.
-    
-    Phase 3.4: Uses job hash to create consistent temp directory names,
-    enabling resume functionality by reusing existing processed files.
-    
-    Args:
-        input_files (list): List of input file paths
-        output_file (str): Path to output audiobook file
-        bitrate (str): Processing bitrate parameter
-        
-    Returns:
-        str: Path to the predictable temporary directory
-    """
-    job_hash = create_job_hash(input_files, output_file, bitrate)
-    temp_base = tempfile.gettempdir()
-    temp_dir = os.path.join(temp_base, f"audiobookmaker_{job_hash}")
-    
-    # Create directory if it doesn't exist
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    logging.info(f"Using job directory: {temp_dir}")
-    return temp_dir
-
-def cleanup_old_cache_directories(max_age_days=30):
-    """
-    Clean up old cache directories to prevent disk space accumulation.
-    
-    Phase 4.3: Intelligent Caching - automatic cache management per Gemini's insights.
-    Removes audiobookmaker_* directories older than specified age.
-    
-    Args:
-        max_age_days (int): Maximum age in days before cleanup
-        
-    Returns:
-        tuple: (directories_removed, space_freed_mb)
-    """
-    temp_base = tempfile.gettempdir()
-    current_time = time.time()
-    max_age_seconds = max_age_days * 24 * 60 * 60
-    
-    directories_removed = 0
-    space_freed_bytes = 0
-    
-    try:
-        for item in os.listdir(temp_base):
-            if item.startswith("audiobookmaker_"):
-                dir_path = os.path.join(temp_base, item)
-                
-                if os.path.isdir(dir_path):
-                    # Check last access time
-                    try:
-                        stat_info = os.stat(dir_path)
-                        last_access = stat_info.st_atime
-                        age_seconds = current_time - last_access
-                        
-                        if age_seconds > max_age_seconds:
-                            # Calculate size before deletion
-                            dir_size = 0
-                            for root, dirs, files in os.walk(dir_path):
-                                for file in files:
-                                    file_path = os.path.join(root, file)
-                                    try:
-                                        dir_size += os.path.getsize(file_path)
-                                    except (OSError, IOError):
-                                        pass
-                            
-                            # Remove the directory
-                            shutil.rmtree(dir_path)
-                            directories_removed += 1
-                            space_freed_bytes += dir_size
-                            
-                            logging.info(f"Cleaned up old cache directory: {dir_path} "
-                                       f"(age: {age_seconds/86400:.1f} days, size: {dir_size/(1024*1024):.1f}MB)")
-                                       
-                    except (OSError, IOError) as e:
-                        logging.warning(f"Could not check/remove cache directory {dir_path}: {e}")
-                        
-    except (OSError, IOError) as e:
-        logging.warning(f"Could not access temp directory for cache cleanup: {e}")
-    
-    space_freed_mb = space_freed_bytes / (1024 * 1024)
-    
-    if directories_removed > 0:
-        logging.info(f"Cache cleanup completed: {directories_removed} directories removed, "
-                    f"{space_freed_mb:.1f}MB freed")
-    else:
-        logging.debug("Cache cleanup: no old directories found")
-    
-    return directories_removed, space_freed_mb
-
-def create_receipt_file(input_file, temp_dir):
-    """
-    Create a receipt file to track input file state for resume validation.
-    
-    Phase 3.4: Stores modification time and file size to detect changes
-    in source files since last processing attempt.
-    
-    Args:
-        input_file (str): Path to the input audio file
-        temp_dir (str): Temporary directory for receipt files
-    """
-    try:
-        file_stats = os.stat(input_file)
-        receipt_data = {
-            'file_path': os.path.abspath(input_file),
-            'modification_time': file_stats.st_mtime,
-            'file_size': file_stats.st_size,
-            'timestamp': datetime.now().isoformat()
+def emit_progress(current, total, stage, speed=None, eta=None, json_mode=False):
+    """Emit progress information."""
+    if json_mode:
+        import json
+        progress_data = {
+            "type": "progress",
+            "current": current,
+            "total": total,
+            "stage": stage,
+            "speed": speed,
+            "eta": eta
         }
-        
-        # Receipt file name based on input file
-        base_name = os.path.splitext(os.path.basename(input_file))[0]
-        receipt_file = os.path.join(temp_dir, f"{base_name}.receipt")
-        
-        with open(receipt_file, 'w', encoding='utf-8') as f:
-            json.dump(receipt_data, f, indent=2)
-            
-        logging.debug(f"Created receipt for {input_file}: {receipt_file}")
-        
-    except Exception as e:
-        logging.warning(f"Failed to create receipt for {input_file}: {e}")
-
-def validate_receipt_file(input_file, temp_dir):
-    """
-    Validate that input file hasn't changed since receipt was created.
-    
-    Phase 3.4: Checks modification time and file size against stored receipt
-    to determine if cached conversion result is still valid.
-    
-    Args:
-        input_file (str): Path to the input audio file
-        temp_dir (str): Temporary directory containing receipt files
-        
-    Returns:
-        bool: True if file is unchanged, False if changed or no receipt exists
-    """
-    try:
-        base_name = os.path.splitext(os.path.basename(input_file))[0]
-        receipt_file = os.path.join(temp_dir, f"{base_name}.receipt")
-        
-        if not os.path.exists(receipt_file):
-            logging.debug(f"No receipt found for {input_file}")
-            return False
-            
-        with open(receipt_file, 'r', encoding='utf-8') as f:
-            receipt_data = json.load(f)
-            
-        # Check current file stats
-        current_stats = os.stat(input_file)
-        
-        # Validate file hasn't changed
-        if (receipt_data['modification_time'] == current_stats.st_mtime and
-            receipt_data['file_size'] == current_stats.st_size):
-            logging.debug(f"Receipt valid for {input_file}")
-            return True
-        else:
-            logging.info(f"File changed since last processing: {input_file}")
-            return False
-            
-    except Exception as e:
-        logging.warning(f"Failed to validate receipt for {input_file}: {e}")
-        return False
-
-def extract_metadata_for_template(input_files):
-    """
-    Extract metadata from source files for filename template generation.
-    
-    Phase 3.2: Uses mutagen to extract metadata from the first valid file
-    to provide template variables like {title}, {author}, {album}, {year}.
-    
-    Args:
-        input_files: List of input audio file paths
-        
-    Returns:
-        Dict containing metadata variables for template substitution
-    """
-    metadata = {
-        'title': 'Audiobook',
-        'author': 'Unknown Author', 
-        'album': 'Unknown Album',
-        'year': datetime.now().strftime('%Y'),
-        'date': datetime.now().strftime('%Y-%m-%d')
-    }
-    
-    if not MUTAGEN_AVAILABLE or not input_files:
-        return metadata
-    
-    # Try to extract metadata from the first file
-    try:
-        from mutagen import File
-        audio_file = File(input_files[0])
-        
-        if audio_file is not None:
-            # Common tag mappings across formats
-            title_tags = ['TIT2', 'TITLE', '\xa9nam']  # ID3, Vorbis, MP4
-            artist_tags = ['TPE1', 'ARTIST', '\xa9ART']  # ID3, Vorbis, MP4  
-            album_tags = ['TALB', 'ALBUM', '\xa9alb']    # ID3, Vorbis, MP4
-            date_tags = ['TDRC', 'DATE', '\xa9day']      # ID3, Vorbis, MP4
-            
-            # Extract title
-            for tag in title_tags:
-                if tag in audio_file and audio_file[tag]:
-                    metadata['title'] = str(audio_file[tag][0]).strip()
-                    break
-            
-            # Extract artist/author
-            for tag in artist_tags:
-                if tag in audio_file and audio_file[tag]:
-                    metadata['author'] = str(audio_file[tag][0]).strip()
-                    break
-                    
-            # Extract album
-            for tag in album_tags:
-                if tag in audio_file and audio_file[tag]:
-                    metadata['album'] = str(audio_file[tag][0]).strip()
-                    break
-                    
-            # Extract year
-            for tag in date_tags:
-                if tag in audio_file and audio_file[tag]:
-                    date_str = str(audio_file[tag][0]).strip()
-                    # Extract year from date string (handle various formats)
-                    import re
-                    year_match = re.search(r'\b(19|20)\d{2}\b', date_str)
-                    if year_match:
-                        metadata['year'] = year_match.group()
-                    break
-                    
-    except Exception as e:
-        logging.warning(f"Could not extract metadata from {input_files[0]}: {e}")
-    
-    return metadata
-
-def apply_filename_template(template, metadata, fallback_name="Audiobook"):
-    """
-    Apply filename template with metadata variable substitution.
-    
-    Phase 3.2: Simple template system using string replacement.
-    Supports variables: {title}, {author}, {album}, {year}, {date}
-    
-    Args:
-        template: Template string with {variable} placeholders
-        metadata: Dict containing metadata values 
-        fallback_name: Fallback name if template fails
-        
-    Returns:
-        Generated filename (without extension)
-    """
-    try:
-        # Sanitize metadata values for filename use
-        safe_metadata = {}
-        for key, value in metadata.items():
-            if value:
-                # Remove invalid filename characters
-                import re
-                safe_value = re.sub(r'[<>:"/\\|?*]', '', str(value))
-                safe_value = safe_value.strip()
-                safe_metadata[key] = safe_value if safe_value else f"Unknown {key.title()}"
-            else:
-                safe_metadata[key] = f"Unknown {key.title()}"
-        
-        # Apply template substitution
-        filename = template
-        for key, value in safe_metadata.items():
-            filename = filename.replace(f'{{{key}}}', value)
-        
-        # Remove any remaining template variables that weren't found
-        import re
-        filename = re.sub(r'\{[^}]*\}', '', filename)
-        filename = filename.strip()
-        
-        # Fallback if template resulted in empty string
-        if not filename or filename.isspace():
-            filename = fallback_name
-            
-        return filename
-        
-    except Exception as e:
-        logging.warning(f"Template application failed: {e}")
-        return fallback_name
-
-def validate_output_path(output_path):
-    """
-    Validate that the output path is writable and handle potential issues.
-    
-    Phase 3.2: Output validation and error handling
-    
-    Args:
-        output_path: Proposed output file path
-        
-    Returns:
-        Tuple of (is_valid, error_message)
-    """
-    try:
-        # Check if directory exists and is writable
-        output_dir = os.path.dirname(output_path)
-        if not os.path.exists(output_dir):
-            return False, f"Output directory does not exist: {output_dir}"
-            
-        if not os.access(output_dir, os.W_OK):
-            return False, f"Output directory is not writable: {output_dir}"
-            
-        # Check if filename is valid
-        filename = os.path.basename(output_path)
-        if not filename or filename.isspace():
-            return False, "Generated filename is empty"
-            
-        # Check for invalid filename characters (Windows)
-        import re
-        if re.search(r'[<>:"/\\|?*]', filename):
-            return False, f"Filename contains invalid characters: {filename}"
-            
-        # Check filename length (Windows limit is 255, be conservative)
-        if len(filename) > 200:
-            return False, f"Filename is too long ({len(filename)} characters): {filename}"
-            
-        return True, None
-        
-    except Exception as e:
-        return False, f"Output path validation error: {str(e)}"
-
-def get_chapter_title(file_path):
-    """
-    Get the best possible chapter title using Gemini's fallback strategy.
-    
-    Phase 3.3: Smart chapter naming with three-tier fallback:
-    1. Priority 1: Read title tag from metadata
-    2. Priority 2: Use filename (cleaned)
-    3. Priority 3: Generic chapter name
-    
-    Args:
-        file_path: Path to the audio file
-        
-    Returns:
-        String containing the best available chapter title
-    """
-    try:
-        # Priority 1: Try to read title tag using mutagen
-        if MUTAGEN_AVAILABLE:
-            from mutagen import File
-            audio_file = File(file_path)
-            
-            if audio_file is not None:
-                # Common title tag mappings across formats
-                title_tags = ['TIT2', 'TITLE', '\xa9nam']  # ID3, Vorbis, MP4
-                
-                for tag in title_tags:
-                    if tag in audio_file and audio_file[tag]:
-                        title = str(audio_file[tag][0]).strip()
-                        if title and not title.isspace():
-                            logging.debug(f"Found title tag for {file_path}: {title}")
-                            return title
-        
-        # Priority 2: Use filename (cleaned)
-        filename = os.path.splitext(os.path.basename(file_path))[0]
-        
-        # Clean up common filename patterns
-        import re
-        # Remove track numbers (01, 001, 1., 01-, etc.)
-        cleaned = re.sub(r'^[\d\s\-\.]+', '', filename).strip()
-        
-        # Remove common prefixes
-        cleaned = re.sub(r'^(chapter|track|part)\s*[\d\s\-\.]*', '', cleaned, flags=re.IGNORECASE).strip()
-        
-        if cleaned and not cleaned.isspace():
-            logging.debug(f"Using cleaned filename for {file_path}: {cleaned}")
-            return cleaned
-        
-        # If cleaning removed everything, use original filename
-        if filename and not filename.isspace():
-            logging.debug(f"Using original filename for {file_path}: {filename}")
-            return filename
-            
-    except Exception as e:
-        logging.warning(f"Error extracting chapter title from {file_path}: {e}")
-    
-    # Priority 3: Generic fallback
-    generic_title = f"Chapter {os.path.basename(file_path)}"
-    logging.debug(f"Using generic title for {file_path}: {generic_title}")
-    return generic_title
-
-def extract_comprehensive_metadata(input_files):
-    """
-    Extract comprehensive metadata using streaming-friendly lazy loading.
-    
-    Phase 3.3: Enhanced metadata extraction with inheritance and conflict resolution.
-    Phase 4.1: Implements lazy loading principle - only reads metadata headers, 
-    never loads actual audio streams into memory.
-    
-    Streaming Architecture:
-    - Uses mutagen's streaming metadata access (reads only file headers)
-    - Processes files individually to maintain constant memory usage
-    - Avoids loading large audio data into Python memory
-    
-    Args:
-        input_files: List of input audio file paths
-        
-    Returns:
-        Dict containing comprehensive metadata including chapter titles
-    """
-    metadata = {
-        'title': 'Audiobook',
-        'author': 'Unknown Author', 
-        'album': 'Unknown Album',
-        'year': datetime.now().strftime('%Y'),
-        'date': datetime.now().strftime('%Y-%m-%d'),
-        'chapter_titles': [],
-        'source_metadata': {}
-    }
-    
-    if not input_files:
-        return metadata
-    
-    # Extract chapter titles from all files
-    for file_path in input_files:
-        chapter_title = get_chapter_title(file_path)
-        metadata['chapter_titles'].append(chapter_title)
-    
-    # Extract base metadata from first file (Phase 3.3 inheritance)
-    if MUTAGEN_AVAILABLE:
-        try:
-            from mutagen import File
-            first_file = File(input_files[0])
-            
-            if first_file is not None:
-                # Store comprehensive source metadata
-                metadata['source_metadata'] = dict(first_file)
-                
-                # Extract primary metadata with priority order
-                title_tags = ['TIT2', 'TITLE', '\xa9nam', 'TALB', 'ALBUM', '\xa9alb']  # Include album as title fallback
-                artist_tags = ['TPE1', 'ARTIST', '\xa9ART', 'TPE2', 'ALBUMARTIST', '\xa9art']  # Include album artist
-                album_tags = ['TALB', 'ALBUM', '\xa9alb']
-                date_tags = ['TDRC', 'DATE', '\xa9day', 'TYER', 'YEAR']
-                
-                # Extract album/book title (primary metadata)
-                for tag in album_tags:
-                    if tag in first_file and first_file[tag]:
-                        title = str(first_file[tag][0]).strip()
-                        if title:
-                            metadata['title'] = title
-                            metadata['album'] = title
-                            break
-                
-                # Extract artist/author
-                for tag in artist_tags:
-                    if tag in first_file and first_file[tag]:
-                        artist = str(first_file[tag][0]).strip()
-                        if artist:
-                            metadata['author'] = artist
-                            break
-                
-                # Extract year/date
-                for tag in date_tags:
-                    if tag in first_file and first_file[tag]:
-                        date_str = str(first_file[tag][0]).strip()
-                        if date_str:
-                            # Extract year from date string
-                            import re
-                            year_match = re.search(r'\b(19|20)\d{2}\b', date_str)
-                            if year_match:
-                                metadata['year'] = year_match.group()
-                            break
-                            
-        except Exception as e:
-            logging.warning(f"Error extracting comprehensive metadata: {e}")
-    
-    # Fallback to basic extraction for template compatibility
-    basic_metadata = extract_metadata_for_template(input_files)
-    for key in ['title', 'author', 'album', 'year', 'date']:
-        if key not in metadata or metadata[key] in ['Audiobook', 'Unknown Author', 'Unknown Album']:
-            if key in basic_metadata and basic_metadata[key] not in ['Audiobook', 'Unknown Author', 'Unknown Album']:
-                metadata[key] = basic_metadata[key]
-    
-    logging.info(f"Extracted metadata for {len(input_files)} files: {len(metadata['chapter_titles'])} chapter titles")
-    return metadata
-
-def determine_output_path(input_files, args, metadata):
-    """
-    Determine the final output file path based on user arguments and metadata.
-    
-    Phase 3.2: Combines output directory, naming template, and custom name options.
-    
-    Args:
-        input_files: List of input file paths
-        args: Parsed command line arguments
-        metadata: Extracted metadata for template variables
-        
-    Returns:
-        Complete output file path
-        
-    Raises:
-        ConfigurationError: If output path is invalid or cannot be created
-    """
-    # Determine output directory
-    if args.output_dir:
-        output_dir = os.path.abspath(args.output_dir)
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(output_dir, exist_ok=True)
-        except OSError as e:
-            raise ConfigurationError(f"Cannot create output directory '{output_dir}': {str(e)}")
+        print(json.dumps(progress_data))
     else:
-        # Default: use directory of first input file
-        output_dir = os.path.dirname(os.path.abspath(input_files[0]))
-    
-    # Determine filename
-    if args.output_name:
-        # User provided explicit filename
-        filename = args.output_name
-        # Remove extension if user provided one (we'll add .m4b)
-        if filename.lower().endswith('.m4b'):
-            filename = filename[:-4]
+        print(f"{stage}...")
+
+def emit_log(level, message, json_mode=False):
+    """Emit log information."""
+    if json_mode:
+        import json
+        log_data = {
+            "type": "log",
+            "level": level,
+            "message": message
+        }
+        print(json.dumps(log_data))
     else:
-        # Generate filename from template
-        filename = apply_filename_template(args.template, metadata)
-    
-    # Combine directory and filename with .m4b extension
-    output_path = os.path.join(output_dir, f"{filename}.m4b")
-    
-    # Validate the output path
-    is_valid, error_msg = validate_output_path(output_path)
-    if not is_valid:
-        raise ConfigurationError(f"Invalid output path: {error_msg}")
-    
-    return output_path
-
-def atoi(text):
-    """Converts a digit string to an integer, otherwise returns the original string"""
-    return int(text) if text.isdigit() else text
-
-def natural_keys(text):
-    """Splits the input text at each digit and applies atoi function to each part for natural sorting"""
-    return [atoi(c) for c in re.split(r'(\d+)', text)]
+        print(message)
 
 def get_audio_duration(input_file):
-    """
-    Retrieves the duration of the provided audio file.
-
-    The function uses the ffprobe command to obtain the duration of the audio file. It then returns this duration, 
-    converted from seconds to milliseconds.
-
-    Args:
-        input_file (str): The path of the input audio file.
-
-    Returns:
-        int: The duration of the audio file in milliseconds.
-
-    Raises:
-        AudioDurationError: If there is an error in executing the ffprobe command or parsing its output.
-    """
-    logging.info(f'Getting duration for {input_file}')
-    ffprobe_command = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
+    """Get audio duration in milliseconds using ffprobe."""
     try:
+        ffprobe_command = [
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+            '-of', 'default=noprint_wrappers=1:nokey=1', input_file
+        ]
         output = subprocess.check_output(ffprobe_command).decode('utf-8').strip()
-        return int(float(output) * 1000)  # convert duration from seconds to milliseconds
+        return int(float(output) * 1000)
     except subprocess.CalledProcessError as e:
-        logging.error(f'Error occurred while getting duration for {input_file}: {str(e)}')
-        raise FileProcessingError(f"Getting duration failed: {str(e)}", input_file, "duration_extraction") from e
+        logging.error(f'Error getting duration for {input_file}: {str(e)}')
+        return 0
 
-def get_audio_properties(input_file):
-    """
-    Extracts the audio properties of the given input file.
+def get_audio_duration_ms(input_file):
+    """Get audio duration in milliseconds using ffprobe."""
+    return get_audio_duration(input_file)
 
-    The function uses ffprobe command to get information about the audio file, including codec, sample rate, 
-    channels, and bit rate. It then returns these properties in a dictionary.
+def natural_keys(text):
+    """Natural sorting key function."""
+    def atoi(text):
+        return int(text) if text.isdigit() else text
+    return [atoi(c) for c in re.split(r'(\d+)', text)]
 
-    Args:
-        input_file (str): The path of the input audio file.
+def extract_comprehensive_metadata(input_files):
+    """Extract comprehensive metadata from input files."""
+    if not input_files:
+        return {}
+    
+    # Use first file for main metadata
+    first_file = input_files[0]
+    metadata = _extract_metadata_from_source(first_file)
+    
+    # Generate chapter titles from filenames
+    chapter_titles = []
+    for file_path in input_files:
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        # Clean up the filename for chapter titles
+        cleaned = re.sub(r'^\d+\s*[-:.)]\s*', '', base_name)
+        cleaned = re.sub(r'^(Chapter|Track|Part)\s*\d+\s*[-:.)]\s*', '', cleaned, flags=re.IGNORECASE)
+        if not cleaned.strip():
+            cleaned = base_name
+        chapter_titles.append(cleaned.strip())
+    
+    return {
+        'title': metadata.get('title', os.path.basename(os.path.dirname(first_file))),
+        'author': metadata.get('artist', 'Unknown Author'),
+        'album': metadata.get('album', os.path.basename(os.path.dirname(first_file))),
+        'year': metadata.get('date', ''),
+        'chapter_titles': chapter_titles
+    }
 
-    Returns:
-        dict: A dictionary containing the audio properties. The keys are 'codec', 'sample_rate', 'channels', 
-        and 'bit_rate'.
+def determine_output_path(input_files, args, metadata):
+    """Determine the output file path based on arguments and metadata."""
+    if args.output:
+        return args.output
+    
+    if args.output_dir:
+        output_dir = args.output_dir
+    else:
+        output_dir = os.path.dirname(input_files[0])
+    
+    if args.output_name:
+        filename = args.output_name
+    else:
+        # Use template
+        template = args.template
+        filename = template.format(
+            title=metadata.get('title', 'Audiobook'),
+            author=metadata.get('author', 'Unknown'),
+            album=metadata.get('album', 'Audiobook'),
+            year=metadata.get('year', '')
+        )
+    
+    # Ensure .m4b extension
+    if not filename.lower().endswith('.m4b'):
+        filename += '.m4b'
+    
+    return os.path.join(output_dir, filename)
 
-    Raises:
-        AudioPropertiesError: If there is an error in executing the ffprobe command or parsing its output.
-    """
-    logging.info(f'Getting properties for {input_file}')
-    # Define ffprobe command to extract audio properties
-    ffprobe_command = ['ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_name,sample_rate,channels,bit_rate', '-of', 'csv=p=0', input_file]
+def create_predictable_temp_dir(input_files, output_file, bitrate):
+    """Create a predictable temporary directory for resume functionality."""
+    import hashlib
+    
+    # Create a hash based on input files, output file, and bitrate
+    hasher = hashlib.md5()
+    for file_path in sorted(input_files):
+        hasher.update(file_path.encode())
+    hasher.update(output_file.encode())
+    hasher.update(bitrate.encode())
+    
+    hash_str = hasher.hexdigest()[:12]
+    temp_base = tempfile.gettempdir()
+    return os.path.join(temp_base, f"audiobookmaker_{hash_str}")
+
+def validate_receipt_file(input_file, temp_dir):
+    """Validate if a receipt file exists and matches the source file."""
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    receipt_file = os.path.join(temp_dir, f"{base_name}.receipt")
+    
+    if not os.path.exists(receipt_file):
+        return False
+    
     try:
-        # Execute command and decode output
-        output = subprocess.check_output(ffprobe_command).decode('utf-8').strip().split(',')
-        # Return a dictionary of properties
-        return {
-            'codec': output[0],           # Audio codec (e.g., mp3, aac)
-            'sample_rate': int(output[1]),  # Sample rate (e.g., 44100, 48000)
-            'channels': int(output[2]),    # Number of channels (e.g., 1 for mono, 2 for stereo)
-            'bit_rate': int(output[3]),   # Bit rate (e.g., 128000 for 128 kbps)
+        with open(receipt_file, 'r') as f:
+            import json
+            receipt = json.load(f)
+        
+        # Check if source file modification time matches
+        source_mtime = os.path.getmtime(input_file)
+        return abs(source_mtime - receipt.get('source_mtime', 0)) < 1.0
+    
+    except Exception:
+        return False
+
+def create_receipt_file(input_file, temp_dir):
+    """Create a receipt file for tracking source file state."""
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    receipt_file = os.path.join(temp_dir, f"{base_name}.receipt")
+    
+    try:
+        import json
+        receipt = {
+            'source_file': input_file,
+            'source_mtime': os.path.getmtime(input_file),
+            'conversion_time': time.time()
         }
-    except subprocess.CalledProcessError as e:
-        logging.error(f'Error occurred while getting properties for {input_file}: {str(e)}')
-        raise FileProcessingError(f"Getting properties failed: {str(e)}", input_file, "properties_extraction") from e
+        
+        with open(receipt_file, 'w') as f:
+            json.dump(receipt, f)
+    
+    except Exception as e:
+        logging.warning(f"Failed to create receipt file: {e}")
 
-def ms_to_timestamp(ms):
-    """
-    Converts a time duration from milliseconds to a timestamp format.
-
-    The function takes a time duration in milliseconds and converts it to a timestamp format of 'HH:MM:SS.mmm',
-    where 'HH' represents hours, 'MM' represents minutes, 'SS' represents seconds, and 'mmm' represents milliseconds.
-
-    Args:
-        ms (int): The time duration in milliseconds.
-
-    Returns:
-        str: The time duration in timestamp format ('HH:MM:SS.mmm').
-    """
-    # convert milliseconds to timestamp format (HH:MM:SS.mmm)
-    seconds, ms = divmod(ms, 1000)
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours:02}:{minutes:02}:{seconds:02}.{ms:03}"
-
-def convert_to_aac(input_file, output_file, bitrate):
-    """
-    Converts the given audio file to AAC format using ffmpeg.
-
-    The function prepares and executes a ffmpeg command for converting the input audio file
-    to AAC format with the specified bitrate. If the conversion process encounters an error,
-    the function logs the error, removes the output file if it was created, and raises a 
-    ConversionError exception.
-
-    Args:
-        input_file (str): The path of the audio file to be converted.
-        output_file (str): The path where the converted file will be saved.
-        bitrate (int): The bitrate for the converted audio file in kbps.
-
-    Returns:
-        str: The path of the converted audio file.
-
-    Raises:
-        ConversionError: If the conversion process fails.
-    """
-    # Prepare the command for ffmpeg to convert the input file to AAC format
-    ffmpeg_command = ['ffmpeg', '-i', input_file, '-vn', '-acodec', 'aac', '-b:a', f'{bitrate}k', '-ar', '44100', '-ac', '2', output_file]
-
+def cleanup_old_cache_directories(max_age_days=30):
+    """Clean up old cache directories."""
+    import glob
+    
+    temp_base = tempfile.gettempdir()
+    pattern = os.path.join(temp_base, "audiobookmaker_*")
+    
+    removed = 0
+    freed_space = 0
+    
     try:
-        # Run the ffmpeg command
-        subprocess.run(ffmpeg_command, check=True)
+        for cache_dir in glob.glob(pattern):
+            if os.path.isdir(cache_dir):
+                mtime = os.path.getmtime(cache_dir)
+                age_days = (time.time() - mtime) / (24 * 3600)
+                
+                if age_days > max_age_days:
+                    import shutil
+                    size = sum(
+                        os.path.getsize(os.path.join(dirpath, filename))
+                        for dirpath, dirnames, filenames in os.walk(cache_dir)
+                        for filename in filenames
+                    )
+                    
+                    shutil.rmtree(cache_dir)
+                    removed += 1
+                    freed_space += size
+    
+    except Exception as e:
+        logging.warning(f"Cache cleanup failed: {e}")
+    
+    return removed, freed_space / (1024 * 1024)  # Return MB
 
-    except subprocess.CalledProcessError as e:
-        # Log the error if there's an issue with the conversion process
-        logging.error(f'Error occurred while converting {input_file} to AAC: {str(e)}')
+def cleanup_temp_files(temp_dir):
+    """Clean up temporary files."""
+    if temp_dir and os.path.exists(temp_dir):
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception as e:
+            logging.warning(f"Failed to cleanup temp directory {temp_dir}: {e}")
 
-        # Check if the output file was created
-        if os.path.exists(output_file):
-            # If it was created, remove it because the conversion process was not successful
-            os.remove(output_file)
-
-        # Raise an exception to stop the script due to the error
-        raise ConversionError(f"Conversion failed: {str(e)}", input_file, 
-                              source_format=os.path.splitext(input_file)[1], 
-                              target_format=".m4a") from e
-
-    return output_file
-
+# Add missing line break before first function
 def extract_chapter_name_from_filename(filename):
     """
     Extracts a smart chapter name from the filename.
@@ -851,8 +316,7 @@ def create_chapters_for_mutagen(input_files, durations):
 def create_smart_chapters_for_mutagen(input_files, durations, chapter_titles):
     """
     Create chapter information using smart extracted titles.
-    
-    Phase 3.3: Enhanced chapter creation with intelligent titles from metadata/filenames.
+
     
     Args:
         input_files (list): List of input file paths.
@@ -883,10 +347,7 @@ def create_smart_chapters_for_mutagen(input_files, durations, chapter_titles):
 
 def add_metadata_to_audiobook(output_file, input_files, durations, metadata=None, cover_art_path=None, chapter_titles=None):
     """
-    Adds comprehensive metadata to the audiobook using Phase 3.3 smart extraction.
-    
-    Phase 3.3: Enhanced metadata writing with smart chapter titles, metadata inheritance,
-    and cover art support using mutagen's surgical precision.
+    Adds enhanced metadata to the M4B audiobook file using mutagen.    
     
     Args:
         output_file (str): Path to the output M4B file.
@@ -900,14 +361,18 @@ def add_metadata_to_audiobook(output_file, input_files, durations, metadata=None
         MetadataError: If metadata processing fails.
     """
     try:
-        logging.info(f'Adding enhanced metadata to {output_file} using Phase 3.3 smart extraction')
+        logging.info(f'Adding enhanced metadata to {output_file}')
+        
+        # Check if mutagen is available
+        if not MUTAGEN_AVAILABLE:
+            logging.warning("Mutagen not available - skipping enhanced metadata")
+            return
         
         # Open the M4B file with mutagen
         audiofile = MP4(output_file)
         
         # Use comprehensive metadata if available, fallback to legacy extraction
         if metadata:
-            # Phase 3.3: Use smart extracted metadata
             audiofile['\xa9nam'] = metadata.get('title', 'Audiobook')
             audiofile['\xa9alb'] = metadata.get('album', metadata.get('title', 'Audiobook'))  # Album = title for audiobooks
             audiofile['\xa9ART'] = metadata.get('author', 'Unknown Author')
@@ -954,7 +419,6 @@ def add_metadata_to_audiobook(output_file, input_files, durations, metadata=None
         # Set as audiobook
         audiofile['stik'] = [2]  # Audiobook media type
         
-        # Phase 3.3: Add cover art if provided
         if cover_art_path:
             try:
                 with open(cover_art_path, 'rb') as cover_file:
@@ -967,7 +431,7 @@ def add_metadata_to_audiobook(output_file, input_files, durations, metadata=None
                 elif cover_ext == '.png':
                     cover_format = MP4Cover.FORMAT_PNG
                 else:
-                    raise MetadataError(f"Unsupported cover art format: {cover_ext}")
+                    raise MetadataError(f"Unsupported cover art format: {cover_ext}", output_file)
                 
                 # Create MP4Cover object and add to file
                 cover = MP4Cover(cover_data, cover_format)
@@ -978,7 +442,6 @@ def add_metadata_to_audiobook(output_file, input_files, durations, metadata=None
                 logging.warning(f'Failed to add cover art: {e}')
                 # Continue without cover art rather than failing
         
-        # Phase 3.3: Create and add smart chapters
         if chapter_titles:
             chapters = create_smart_chapters_for_mutagen(input_files, durations, chapter_titles)
         else:
@@ -1003,7 +466,7 @@ def add_metadata_to_audiobook(output_file, input_files, durations, metadata=None
         
     except Exception as e:
         logging.error(f'Error adding enhanced metadata to {output_file}: {str(e)}')
-        raise MetadataError(f"Adding enhanced metadata to {output_file} failed: {str(e)}") from e
+        raise MetadataError(f"Adding enhanced metadata failed: {str(e)}", output_file) from e
 
 def _extract_metadata_from_source(input_file):
     """
@@ -1075,16 +538,6 @@ def _add_chapters_to_file(audiofile, chapters):
 def process_audio_files(input_files, output_file, bitrate="128k", cores=None, progress_tracker=None, resume_mode="auto"):
     """Processes audio files with comprehensive resource management and resume functionality.
 
-    This function implements Phase 2.4 resource management, Phase 3.4 resume functionality,
-    and Phase 4.3 intelligent caching (merged per Gemini's insights):
-    - Memory usage monitoring and limits
-    - Disk space verification  
-    - Guaranteed cleanup of temporary files
-    - Signal handling for graceful shutdown
-    - Predictable temporary directories for resume capability
-    - Existing conversion detection and validation (intelligent caching)
-    - Automatic cleanup of old cache directories
-
     Args:
         input_files (list): List of paths to input audio files.
         output_file (str): Path to output audio file.
@@ -1097,7 +550,6 @@ def process_audio_files(input_files, output_file, bitrate="128k", cores=None, pr
     """
     global tempdir
     
-    # Phase 4.3: Automatic cache cleanup (merged with Resume Functionality per Gemini's insights)
     try:
         removed, freed_mb = cleanup_old_cache_directories(max_age_days=30)
         if removed > 0:
@@ -1105,7 +557,7 @@ def process_audio_files(input_files, output_file, bitrate="128k", cores=None, pr
     except Exception as e:
         logging.warning(f"Cache cleanup failed: {e}")
     
-    # Phase 3.4: Handle resume modes and create temporary directory
+    # Handle resume modes and create temporary directory
     if resume_mode == "never":
         # Force fresh start - clear any existing predictable temp directory
         predictable_temp_dir = create_predictable_temp_dir(input_files, output_file, bitrate)
@@ -1120,6 +572,8 @@ def process_audio_files(input_files, output_file, bitrate="128k", cores=None, pr
     else:
         # Create predictable temporary directory for resume functionality  
         predictable_temp_dir = create_predictable_temp_dir(input_files, output_file, bitrate)
+        # Ensure the directory exists on the filesystem
+        os.makedirs(predictable_temp_dir, exist_ok=True)
     
     # Check for existing conversions to detect resume scenario (unless "never" mode)
     existing_conversions = []
@@ -1333,31 +787,6 @@ Examples:
   python AudiobookMakerPy.py /path/to/files/ --title "My Book" --author "Author Name"
   python AudiobookMakerPy.py /path/to/files/ --output /custom/path/output.m4b
   python AudiobookMakerPy.py /path/to/files/ --bitrate 64k --cores 2
-  
-Phase 3.2 - Flexible Output Control:
-  python AudiobookMakerPy.py /path/to/files/ --output-dir /custom/output/
-  python AudiobookMakerPy.py /path/to/files/ --output-name "My Custom Book"
-  python AudiobookMakerPy.py /path/to/files/ --quality high --template "{author} - {title}"
-  python AudiobookMakerPy.py /path/to/files/ --template "{author} - {album} ({year})"
-
-Phase 3.3 - Smart Metadata Extraction:
-  python AudiobookMakerPy.py /path/to/files/ --cover cover.jpg --chapter-titles auto
-  python AudiobookMakerPy.py /path/to/files/ --cover art.png --chapter-titles filename
-  python AudiobookMakerPy.py /path/to/files/ --quality high --cover cover.jpg
-
-Phase 3.4 - Resume Functionality:
-  python AudiobookMakerPy.py /path/to/files/ --resume auto  # Resume if possible (default)
-  python AudiobookMakerPy.py /path/to/files/ --resume never  # Always start fresh
-  python AudiobookMakerPy.py /path/to/files/ --resume force  # Fail if cannot resume
-
-Phase 4.2 - Adaptive Parallelism Configuration:
-  Create ~/.audiobookmaker_config.json with: {"max_cpu_cores": 4}
-  Command-line --cores argument always overrides config file setting
-
-Phase 4.3 - Intelligent Caching (merged with Resume Functionality):
-  python AudiobookMakerPy.py /path/to/files/ --clear-cache  # Clear cache before processing
-  python AudiobookMakerPy.py /path/to/files/ --clear        # Short form for cache clearing
-  # Automatic cleanup of cache directories older than 30 days occurs on each run
 
 Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         """
@@ -1407,13 +836,24 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
     )
     
     parser.add_argument(
+        '--gui',
+        action='store_true',
+        help='GUI mode: show progress but auto-overwrite files without prompts'
+    )
+    
+    parser.add_argument(
+        '--json-output',
+        action='store_true', 
+        help='Output structured JSON for progress and logging (for sidecar integration)'
+    )
+    
+    parser.add_argument(
         '--validation-level', '--val',
         choices=['lax', 'normal', 'strict', 'paranoid'],
         default='normal',
         help='Validation strictness level (default: normal)'
     )
     
-    # Phase 3.2: Flexible Output Control arguments
     parser.add_argument(
         '--output-dir', '--dir',
         type=str,
@@ -1440,7 +880,6 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         help='Filename template using metadata variables: {title}, {author}, {album}, {year} (default: {title})'
     )
     
-    # Phase 3.3: Smart Metadata Extraction arguments
     parser.add_argument(
         '--cover', '--cover-art',
         type=str,
@@ -1454,7 +893,6 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         help='Chapter title source: auto (smart extraction), filename (use filenames), generic (Chapter 1, 2, etc.)'
     )
     
-    # Phase 3.4: Resume Functionality arguments
     parser.add_argument(
         '--resume',
         choices=['auto', 'never', 'force'],
@@ -1462,7 +900,6 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
         help='Resume behavior: auto (resume if possible), never (always start fresh), force (fail if cannot resume)'
     )
     
-    # Phase 4.3: Intelligent Caching (merged with Resume Functionality per Gemini's insights)
     parser.add_argument(
         '--clear-cache', '--clear',
         action='store_true',
@@ -1472,17 +909,15 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
     parser.add_argument(
         '--version', '-v',
         action='version',
-        version='AudiobookMakerPy 2.0 (Phase 3.4)'
+        version='AudiobookMakerPy 2.0)'
     )
     
     args = parser.parse_args()
     
-    # Phase 4.3: Handle --clear-cache argument (merged with Resume Functionality)
     if args.clear_cache:
         args.resume = 'never'
         logging.info("Cache clearing requested: setting resume mode to 'never'")
     
-    # Phase 3.2: Process quality presets
     quality_presets = {
         'low': '96k',
         'medium': '128k', 
@@ -1493,7 +928,6 @@ Supported audio formats: MP3, WAV, M4A, FLAC, OGG, AAC, M4B
     if args.quality != 'custom':
         args.bitrate = quality_presets[args.quality]
     
-    # Phase 3.3: Validate cover art if provided
     if args.cover:
         if not os.path.exists(args.cover):
             parser.error(f"Cover art file does not exist: {args.cover}")
@@ -1661,9 +1095,6 @@ def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
     """
     Converts an audio file to AAC format for concatenation with resume functionality.
     
-    Phase 3.4: Idempotent conversion function that checks for existing converted files
-    and validates source file changes using receipt files to enable resume functionality.
-    
     Args:
         input_file (str): Path to the input audio file.
         temp_dir (str): Directory for temporary files.
@@ -1680,7 +1111,7 @@ def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
         base_name = os.path.splitext(os.path.basename(input_file))[0]
         temp_file = os.path.join(temp_dir, f"{base_name}_converted.m4a")
         
-        # Phase 3.4: Check for existing conversion and validate receipt
+        # Check for existing conversion and validate receipt
         if os.path.exists(temp_file):
             if validate_receipt_file(input_file, temp_dir):
                 # File exists and source hasn't changed - resume by skipping conversion
@@ -1731,31 +1162,149 @@ def convert_file_for_concatenation(input_file, temp_dir, bitrate="128k"):
             )
             duration_ms = len(audio)
             
-            # Phase 3.4: Create receipt file after successful pydub conversion
+            # Create receipt file after successful pydub conversion
             create_receipt_file(input_file, temp_dir)
         else:
-            # Fallback to FFmpeg subprocess (original method)
-            ffmpeg_command = [
-                'ffmpeg', '-i', input_file, '-vn', '-acodec', 'aac', 
-                '-b:a', f'{bitrate}', '-ar', '44100', '-ac', '2', temp_file
-            ]
-            subprocess.run(ffmpeg_command, check=True)
-            
-            # Get duration using ffprobe
-            duration_ms = get_audio_duration_fallback(input_file)
-        
-        # Phase 3.4: Create receipt file after successful conversion
+            # Fallback to FFmpeg subprocess with progress tracking
+            try:
+                duration_ms = convert_with_ffmpeg_progress(input_file, temp_file, bitrate)
+            except Exception as e:
+                # If FFmpeg fails, try a simpler approach without progress tracking
+                logging.warning(f"FFmpeg progress tracking failed: {e}, trying basic conversion")
+                duration_ms = convert_with_basic_ffmpeg(input_file, temp_file, bitrate)
+                
+        # Create receipt file after successful conversion
         create_receipt_file(input_file, temp_dir)
         
         logging.info(f'Converted {input_file} to {temp_file}, duration: {duration_ms}ms')
-        return temp_file, duration_ms
-        
+        return temp_file, duration_ms        
     except Exception as e:
         logging.error(f'Error converting {input_file}: {str(e)}')
         raise ConversionError(f"Conversion failed: {str(e)}", input_file, 
                               source_format=os.path.splitext(input_file)[1], 
                               target_format=".m4a") from e
 
+def convert_with_ffmpeg_progress(input_file, output_file, bitrate="128k"):
+    """
+    Convert audio file with smooth FFmpeg progress tracking.
+    
+    Args:
+        input_file (str): Input audio file path
+        output_file (str): Output file path
+        bitrate (str): Audio bitrate
+        
+    Returns:
+        int: Duration in milliseconds
+    """
+    import re
+    import time
+    
+    # Ensure debug logging is available
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug("=== FFmpeg Progress Debug Mode Enabled ===")
+    
+    # Get total duration for progress calculation
+    try:
+        total_duration_ms = get_audio_duration(input_file)
+        total_duration_seconds = total_duration_ms / 1000.0
+    except:
+        total_duration_seconds = 0
+    
+    ffmpeg_command = [
+        'ffmpeg', '-y', '-i', input_file, '-vn', '-c:a', 'aac', 
+        '-b:a', f'{bitrate}', '-ar', '44100', '-ac', '2', output_file,
+        '-loglevel', 'error', '-stats'
+    ]
+    
+    process = subprocess.Popen(
+        ffmpeg_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        bufsize=1
+    )
+    
+    # Regex patterns for FFmpeg progress (more comprehensive and robust)
+    time_pattern = re.compile(r'time[=\s]*(\d{2}):(\d{2}):(\d{2}(?:\.\d{2,3})?)')
+    speed_pattern = re.compile(r'speed[=\s]*(\d+\.?\d*)x?')
+    
+    # Simplified patterns for basic stats
+    basic_time_pattern = re.compile(r'time[=\s]*(\d{2}:\d{2}:\d{2}(?:\.\d{2})?)')
+    basic_speed_pattern = re.compile(r'speed[=\s]*(\d+\.?\d*)x')
+    
+    start_time = time.time()
+    last_update_time = 0
+    
+    # Debug: Log the FFmpeg command being executed
+    logging.debug(f"FFmpeg command: {' '.join(ffmpeg_command)}")
+    
+    try:
+        # Read FFmpeg stderr for progress information with timeout
+        progress_lines_count = 0
+        for line in iter(process.stderr.readline, ''):
+            if not line:
+                continue
+                
+            line = line.strip()
+            logging.debug(f"FFmpeg stderr: {line}")
+            
+            # Parse time progress
+            time_match = time_pattern.search(line)
+            if time_match and total_duration_seconds > 0:
+                hours, minutes, seconds = time_match.groups()
+                current_seconds = float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+                progress_percent = min(100.0, (current_seconds / total_duration_seconds) * 100)
+                
+                # Parse speed
+                speed_match = speed_pattern.search(line)
+                speed = speed_match.group(1) if speed_match else "0.0"
+                
+                # Calculate ETA
+                elapsed = time.time() - start_time
+                if float(speed) > 0:
+                    eta_seconds = (total_duration_seconds - current_seconds) / float(speed)
+                    eta_formatted = time.strftime('%H:%M:%S', time.gmtime(eta_seconds))
+                else:
+                    eta_formatted = "calculating..."
+                
+                # Emit progress (throttled) - disabled in multiprocessing mode
+                current_time = time.time()
+                if current_time - last_update_time >= 0.5:  # Update every 500ms
+                    # Skip progress emission in multiprocessing to avoid confusion
+                    # emit_progress(
+                    #     current=int(progress_percent),
+                    #     total=100,
+                    #     stage=f"Converting: {progress_percent:.1f}%",
+                    #     speed=f"{speed}x",
+                    #     eta=eta_formatted
+                    # )
+                    last_update_time = current_time
+        
+        # Wait for process completion with timeout
+        try:
+            process.wait(timeout=300)  # 5 minute timeout per file
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise ConversionError(f"FFmpeg conversion timed out after 5 minutes", input_file)
+            
+        if process.returncode != 0:
+            # Capture stderr for error details
+            stderr_output = process.stderr.read()
+            raise ConversionError(f"FFmpeg conversion failed: {stderr_output}", input_file)
+            
+    except Exception as e:
+        # Ensure process is terminated on any error
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        raise
+    
+    # Get final duration for verification
+    final_duration = get_audio_duration_fallback(input_file)
+    logging.debug(f"Final audio duration: {final_duration}ms")
+    
+    return final_duration
 def get_audio_duration_fallback(input_file):
     """
     Fallback method to get audio duration using ffprobe.
@@ -1775,18 +1324,6 @@ def _concatenate_audio_files(converted_files, output_file, temp_dir):
     """
     Concatenates audio files using streaming architecture for memory efficiency.
     
-    Phase 4.1 Streaming Processing Implementation:
-    This function implements the core streaming concatenation strategy that enables processing
-    of large audiobook collections without memory exhaustion. Uses FFmpeg's streaming 
-    capabilities instead of loading all audio data into Python memory.
-    
-    Memory Architecture:
-    - pydub concatenation: Loads ALL files into memory (6GB+ for large collections)
-    - FFmpeg concatenation: Streams from disk with constant minimal RAM usage
-    
-    Per Gemini's analysis: This streaming approach is not just an optimization but a 
-    core requirement for the application to function reliably with real-world large files.
-    
     Args:
         converted_files (list): List of temporary converted file paths.
         output_file (str): Path for the final output file.
@@ -1796,81 +1333,28 @@ def _concatenate_audio_files(converted_files, output_file, temp_dir):
         ConversionError: If concatenation fails.
     """
     try:
-        # Phase 4.1: Always use streaming FFmpeg concatenation to prevent memory exhaustion
-        # This implements the "Pipeline Processing" architecture from claude_plan.md
         _concatenate_with_ffmpeg(converted_files, output_file, temp_dir)
     except Exception as e:
         logging.error(f'Concatenation failed: {str(e)}')
         raise ConcatenationError(f"Audio concatenation failed: {str(e)}") from e
 
-def _concatenate_with_pydub(converted_files, output_file):
-    """
-    **DEPRECATED** - In-memory concatenation method.
-    
-    Phase 4.1 Streaming Processing - EXPLICIT REJECTION:
-    This method violates the core principles of streaming processing by loading all 
-    audio files into Python memory simultaneously. As per Gemini's analysis, this 
-    approach is fundamentally incompatible with real-world large audiobook processing.
-    
-    Memory Impact:
-    - Loads ALL converted files into RAM at once
-    - Can consume 6GB+ for large audiobook collections  
-    - Causes memory exhaustion and application crashes
-    - Violates the "File-by-File Processing" principle
-    
-    This method is kept only for documentation purposes to prevent future maintainers
-    from accidentally re-introducing the memory bug. DO NOT USE in production.
-    
-    Use _concatenate_with_ffmpeg for all production concatenation operations.
-    """
-    logging.warning(f'Using memory-intensive pydub concatenation for {len(converted_files)} files')
-    logging.info(f'Concatenating {len(converted_files)} files using pydub')
-    
-    # Load first file to establish format
-    final_audio = AudioSegment.from_file(converted_files[0])
-    
-    # Add remaining files
-    for temp_file in converted_files[1:]:
-        audio_segment = AudioSegment.from_file(temp_file)
-        final_audio += audio_segment
-        logging.debug(f'Added {temp_file} to concatenation')
-    
-    # Export with optimized settings
-    logging.info(f'Exporting final audiobook to {output_file}')
-    final_audio.export(
-        output_file,
-        format="ipod",  # M4B compatible format
-        bitrate="128k",
-        parameters=[
-            "-ar", "44100",  # Sample rate
-            "-ac", "2",      # Stereo
-            "-movflags", "+faststart"  # Optimize for streaming
-        ]
-    )
-    
-    logging.info(f'Successfully exported {len(converted_files)} files to {output_file}')
-
 def _concatenate_with_ffmpeg(converted_files, output_file, temp_dir):
     """
     Concatenates audio files using FFmpeg concat demuxer with memory pressure monitoring.
-    
-    Phase 4.1 Streaming Processing Implementation:
-    Uses FFmpeg's streaming concat demuxer to process files without loading them into memory.
-    Includes memory pressure detection and response mechanisms.
     """
     logging.info(f'Concatenating {len(converted_files)} files using FFmpeg streaming architecture')
     
-    # Phase 4.1: Memory pressure detection before concatenation
+    # Memory pressure detection before concatenation
     try:
         from resource_manager import ResourceMonitor
         monitor = ResourceMonitor()
         memory_stats = monitor.get_current_memory_usage()
-        logging.info(f"Pre-concatenation memory usage: {memory_stats['percent_used']:.1f}% "
-                    f"({memory_stats['used_mb']:.1f}MB used)")
+        logging.info(f"Pre-concatenation memory usage: {memory_stats['percent']:.1f}% "
+                    f"({memory_stats['rss_mb']:.1f}MB used)")
         
         # Check if we're approaching memory limits before starting concatenation
-        if memory_stats['percent_used'] > 80:
-            logging.warning(f"High memory usage detected ({memory_stats['percent_used']:.1f}%) before concatenation")
+        if memory_stats['percent'] > 80:
+            logging.warning(f"High memory usage detected ({memory_stats['percent']:.1f}%) before concatenation")
             logging.info("FFmpeg streaming concatenation will help maintain low memory usage")
     except ImportError:
         logging.debug("Resource monitoring not available for concatenation")
@@ -1890,33 +1374,32 @@ def _concatenate_with_ffmpeg(converted_files, output_file, temp_dir):
         except PermissionError:
             logging.warning(f'Could not remove existing {output_file}, FFmpeg will overwrite')
     
-    # Enhanced FFmpeg concatenation command
-    # Phase 4.1: Uses streaming concat demuxer for constant memory usage
+    # Uses streaming concat demuxer for constant memory usage
     ffmpeg_concat_command = [
         'ffmpeg', 
+        '-y',  # Automatically overwrite existing files
         '-f', 'concat',
         '-safe', '0',
         '-i', concat_file,
         '-c', 'copy',  # Copy streams without re-encoding (streaming)
         '-movflags', '+faststart',  # Optimize for streaming
-        '-y',  # Overwrite output file
         output_file
     ]
     
     logging.debug(f'Running FFmpeg streaming command: {" ".join(ffmpeg_concat_command)}')
     
-    # Phase 4.1: Monitor memory during concatenation operation
+    # Monitor memory during concatenation operation
     try:
         result = subprocess.run(ffmpeg_concat_command, capture_output=True, text=True)
         
         # Post-concatenation memory check
         try:
             post_memory = monitor.get_current_memory_usage()
-            logging.info(f"Post-concatenation memory usage: {post_memory['percent_used']:.1f}% "
-                        f"({post_memory['used_mb']:.1f}MB used)")
+            logging.info(f"Post-concatenation memory usage: {post_memory['percent']:.1f}% "
+                        f"({post_memory['rss_mb']:.1f}MB used)")
             
             # Verify streaming architecture maintained low memory usage
-            memory_increase = post_memory['used_mb'] - memory_stats['used_mb']
+            memory_increase = post_memory['rss_mb'] - memory_stats['rss_mb']
             if memory_increase < 100:  # Less than 100MB increase is expected for streaming
                 logging.info(f"Streaming concatenation successful: only {memory_increase:.1f}MB memory increase")
             else:
@@ -1958,16 +1441,29 @@ if __name__ == '__main__':
     # Setup logging with quiet mode support
     setup_logging(quiet=args.quiet)
     
-    print("AudiobookMakerPy v2.0 - Phase 3.4 (Resume Functionality)")
-    print("=" * 50)
+    # JSON mode for sidecar integration
+    json_mode = args.json_output
+    
+    if not json_mode:
+        print("=" * 50)
+    else:
+        emit_log("info", "AudiobookMakerPy)", json_mode)
     
     # Initialize progress tracking and timer
-    progress_tracker = create_progress_tracker(quiet=args.quiet)
+    # In GUI mode, we want progress output but non-interactive behavior
+    progress_quiet = args.quiet and not args.gui
+    progress_tracker = create_progress_tracker(quiet=progress_quiet)
     processing_timer = ProcessingTimer()
     processing_timer.start()
     
     # Validate and collect input files
     input_files = validate_and_get_input_files(args.input_paths)
+    
+    # Log file information in JSON mode
+    if json_mode:
+        for file_path in input_files:
+            emit_log("info", f"Added audio file: {os.path.basename(file_path)}", json_mode)
+        emit_log("info", f"Total audio files to process: {len(input_files)}", json_mode)
     
     # Pre-flight validation with progress tracking
     validation_level = ValidationLevel(args.validation_level)
@@ -1975,6 +1471,7 @@ if __name__ == '__main__':
     try:
         # Step 1: Validation with progress bar
         progress_tracker.print_step("Pre-flight validation", 1, 3)
+        emit_progress(10, 100, "Pre-flight validation", json_mode=json_mode)
         
         def validation_progress_callback(current, file_path, is_valid):
             status = "OK" if is_valid else "FAIL"
@@ -2010,16 +1507,16 @@ if __name__ == '__main__':
             input_files = valid_files
         else:
             progress_tracker.print_step("All files passed validation - OK", 1, 3)
+            emit_progress(20, 100, "All files passed validation", json_mode=json_mode)
             
     except Exception as e:
         print(f"[ERROR] Pre-flight validation failed: {str(e)}")
         logging.error(f"Validation error: {str(e)}")
         sys.exit(1)
     
-    # Phase 3.3: Extract comprehensive metadata for smart processing
+    # Extract comprehensive metadata for smart processing
     print("\nExtracting comprehensive metadata for smart processing...")
     try:
-        # Use comprehensive extraction for Phase 3.3 features
         comprehensive_metadata = extract_comprehensive_metadata(input_files)
         
         # Extract chapter titles based on user preference
@@ -2040,7 +1537,7 @@ if __name__ == '__main__':
             if args.cover:
                 print(f"Cover art: {args.cover}")
         
-        # Phase 3.2: Determine output file with flexible control
+        # Determine output file with flexible control
         output_file = determine_output_path(input_files, args, comprehensive_metadata)
         
         # Show user the planned output
@@ -2062,21 +1559,27 @@ if __name__ == '__main__':
     # Check if output file already exists
     if os.path.exists(output_file):
         print(f"Warning: Output file already exists: {output_file}")
-        response = input("Do you want to overwrite it? (y/N): ").strip().lower()
-        if response != 'y' and response != 'yes':
-            print("Operation cancelled by user")
-            sys.exit(0)
+        if args.quiet or args.gui:
+            # In quiet mode or GUI mode, automatically overwrite
+            print("Automatically overwriting existing file (quiet/GUI mode)")
+        else:
+            response = input("Do you want to overwrite it? (y/N): ").strip().lower()
+            if response != 'y' and response != 'yes':
+                print("Operation cancelled by user")
+                sys.exit(0)
     
     all_errors = []
     
     try:
         # Check dependencies first
         progress_tracker.print_step("Checking dependencies", 2, 3)
+        emit_progress(30, 100, "Checking dependencies", json_mode=json_mode)
         ffmpeg_version = check_ffmpeg_dependency()
         logging.info(f'FFmpeg version: {ffmpeg_version}')
         
         # Process files and get durations
         progress_tracker.print_step("Processing audio files", 3, 3)
+        emit_progress(40, 100, "Processing audio files", json_mode=json_mode)
         file_durations, processing_errors = process_audio_files(
             input_files, 
             output_file, 
@@ -2094,7 +1597,7 @@ if __name__ == '__main__':
             logging.error('No files were successfully processed')
             sys.exit(1)
         
-        # Phase 3.3: Add comprehensive metadata using smart extraction
+        # Add comprehensive metadata using smart extraction
         if not args.quiet:
             with progress_tracker.operation_progress("Writing enhanced metadata", show_spinner=True) as metadata_progress:
                 try:
@@ -2196,3 +1699,39 @@ if __name__ == '__main__':
         # Final error reporting
         if all_errors and len(all_errors) > 0:
             logging.info(f'Session completed with {len(all_errors)} total errors')
+
+def convert_with_basic_ffmpeg(input_file, output_file, bitrate="128k"):
+    """
+    Basic FFmpeg conversion without progress tracking for reliability.
+    
+    Args:
+        input_file (str): Input audio file path
+        output_file (str): Output file path
+        bitrate (str): Audio bitrate
+        
+    Returns:
+        int: Duration in milliseconds
+    """
+    ffmpeg_command = [
+        'ffmpeg', '-y', '-i', input_file, '-vn', '-c:a', 'aac', 
+        '-b:a', f'{bitrate}', '-ar', '44100', '-ac', '2', output_file,
+        '-loglevel', 'error'
+    ]
+    
+    try:
+        result = subprocess.run(
+            ffmpeg_command,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout per file
+        )
+        
+        if result.returncode != 0:
+            raise ConversionError(f"FFmpeg conversion failed: {result.stderr}", input_file)
+            
+        return get_audio_duration_fallback(input_file)
+        
+    except subprocess.TimeoutExpired:
+        raise ConversionError("FFmpeg conversion timed out after 5 minutes", input_file)
+    except Exception as e:
+        raise ConversionError(f"FFmpeg conversion error: {str(e)}", input_file)
