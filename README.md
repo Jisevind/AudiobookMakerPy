@@ -62,6 +62,22 @@ chmod +x scripts/install_deps.sh
 
 ## Usage
 
+### Graphical User Interface
+
+AudiobookMakerPy also includes a PyQt6-based GUI for those who prefer a graphical interface:
+
+```bash
+# Launch GUI
+python src/audiobookmaker/gui.py
+
+# Or use the executable (Windows/Linux)
+./dist/AudiobookMaker-GUI
+```
+
+![GUI Interface](screenshots/input_files.png)
+
+The GUI provides drag-and-drop file management, real-time processing logs, cover art preview, and all the same features as the command-line interface.
+
 ### Command Line Interface
 
 ```bash
