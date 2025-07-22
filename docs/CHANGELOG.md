@@ -5,6 +5,39 @@ All notable changes to AudiobookMakerPy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2025-01-22
+
+### Added
+- **PyQt6 GUI Interface**: Complete graphical user interface with tabbed design
+  - Drag-and-drop file management with natural sorting
+  - Real-time processing logs with FFmpeg command visibility
+  - Cover art preview and management
+  - Quality presets and metadata controls
+  - Smart chapter title generation options
+- **Executable Building**: PyInstaller configuration for standalone executables
+  - Windows executable with custom icon integration
+  - Linux executable support
+  - Automated build scripts with dependency checking
+- **Icon Integration**: Custom application icon throughout the interface
+  - Window title bar and taskbar icons
+  - Enhanced About dialog with branding
+  - Cross-platform icon loading with fallback paths
+- **Enhanced Processing**: 
+  - Console window hiding for Windows compatibility
+  - Module-level worker functions for PyInstaller compatibility
+  - Multiprocessing spawn method for cross-platform support
+  - Command capture and logging interception for GUI feedback
+
+### Changed
+- **Core Modules**: Updated converter, concatenator, and metadata modules with subprocess improvements
+- **Multiprocessing**: Enhanced compatibility with PyInstaller executables
+- **Dependencies**: Added PyQt6 and PyInstaller to requirements
+
+### Fixed
+- **Windows Compatibility**: Resolved console window flashing issues
+- **Multiprocessing Issues**: Fixed PyInstaller worker process spawning
+- **GUI Responsiveness**: Non-blocking audio processing with threading
+
 ## [2.0.0] - 2025-07-16
 
 ### Added
@@ -31,8 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Validation Logic**: Better audio file validation and error reporting
 
 ### Removed
-- **GUI Components**: Removed GUI-related code (kept CLI interface)
-- **Legacy Code**: Removed outdated functions and approaches
+- **Legacy Dependencies**: Cleaned up outdated code and approaches
 
 ## [1.x.x] - Previous Versions
 
@@ -66,7 +98,13 @@ python AudiobookMakerPy.py /path/to/files/
 
 **New usage:**
 ```bash
+# Command line interface
 audiobookmaker /path/to/files/
+
+# Graphical interface (v2.1.0+)
+python src/audiobookmaker/gui.py
+# or use the executable
+./dist/AudiobookMaker-GUI
 ```
 
 ### For Programmatic Users
