@@ -12,6 +12,19 @@ from typing import Dict, List, Any, Optional, Tuple
 from ..exceptions import MetadataError
 
 
+def _get_subprocess_startupinfo():
+    """Get startupinfo to hide console windows on Windows."""
+    startupinfo = None
+    creationflags = 0
+    if os.name == 'nt':  # Windows
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        # Additional flag to prevent console window creation
+        creationflags = subprocess.CREATE_NO_WINDOW
+    return startupinfo, creationflags
+
+
 class MetadataExtractor:
     """Handles metadata extraction from audio files."""
     
@@ -71,7 +84,15 @@ class MetadataExtractor:
                 'ffprobe', '-v', 'quiet', '-print_format', 'json', 
                 '-show_format', input_file
             ]
-            result = subprocess.run(ffprobe_command, capture_output=True, text=True, check=True)
+            startupinfo, creationflags = _get_subprocess_startupinfo()
+            result = subprocess.run(
+                ffprobe_command, 
+                capture_output=True, 
+                text=True, 
+                check=True,
+                startupinfo=startupinfo,
+                creationflags=creationflags
+            )
             
             data = json.loads(result.stdout)
             format_tags = data.get('format', {}).get('tags', {})

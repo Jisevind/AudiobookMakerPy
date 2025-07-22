@@ -10,6 +10,19 @@ from typing import List
 from ..exceptions import ConcatenationError
 
 
+def _get_subprocess_startupinfo():
+    """Get startupinfo to hide console windows on Windows."""
+    startupinfo = None
+    creationflags = 0
+    if os.name == 'nt':  # Windows
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        # Additional flag to prevent console window creation
+        creationflags = subprocess.CREATE_NO_WINDOW
+    return startupinfo, creationflags
+
+
 class AudioConcatenator:
     """Handles audio file concatenation operations."""
     
@@ -94,7 +107,14 @@ class AudioConcatenator:
         
         # Monitor memory during concatenation operation
         try:
-            result = subprocess.run(ffmpeg_concat_command, capture_output=True, text=True)
+            startupinfo, creationflags = _get_subprocess_startupinfo()
+            result = subprocess.run(
+                ffmpeg_concat_command, 
+                capture_output=True, 
+                text=True,
+                startupinfo=startupinfo,
+                creationflags=creationflags
+            )
             
             # Post-concatenation memory check
             if monitor and memory_stats:

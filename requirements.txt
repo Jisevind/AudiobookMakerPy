@@ -10,3 +10,9 @@ mutagen>=1.47.0
 
 # Progress indicators and user experience
 tqdm>=4.65.0
+
+# GUI framework (optional - for PyQt6 GUI)
+PyQt6>=6.4.0
+
+# Build tools (for creating executables)
+pyinstaller>=6.0.0

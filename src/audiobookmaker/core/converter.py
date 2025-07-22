@@ -7,8 +7,22 @@ import subprocess
 import logging
 import time
 import re
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from typing import List, Tuple, Optional
+
+
+def _get_subprocess_startupinfo():
+    """Get startupinfo to hide console windows on Windows."""
+    startupinfo = None
+    creationflags = 0
+    if os.name == 'nt':  # Windows
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        # Additional flag to prevent console window creation
+        creationflags = subprocess.CREATE_NO_WINDOW
+    return startupinfo, creationflags
 
 from ..utils.resource_manager import (
     managed_processing, get_signal_handler, get_timeout_manager
@@ -19,6 +33,63 @@ from ..exceptions import (
     DependencyError, ConversionError, FileProcessingError,
     ProcessingError, ConcatenationError
 )
+
+
+def _convert_file_worker(args):
+    """
+    Module-level worker function for multiprocessing compatibility.
+    
+    This function is defined at module level to ensure it can be pickled
+    properly for ProcessPoolExecutor, especially when using PyInstaller.
+    """
+    input_file, temp_dir, bitrate = args
+    
+    import os
+    import subprocess
+    from ..utils.file_utils import get_audio_duration
+    
+    # Generate output filename
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    output_file = os.path.join(temp_dir, f"{base_name}.aac")
+    
+    # Check if file already exists (resume functionality)
+    if os.path.exists(output_file):
+        try:
+            duration = get_audio_duration(output_file)
+            return output_file, duration
+        except Exception:
+            # If existing file is corrupted, remove and re-convert
+            os.remove(output_file)
+    
+    # Convert using basic FFmpeg
+    ffmpeg_command = [
+        'ffmpeg', '-y', '-i', input_file, '-vn', '-c:a', 'aac', 
+        '-b:a', f'{bitrate}', '-ar', '44100', '-ac', '2', output_file,
+        '-loglevel', 'error'
+    ]
+    
+    try:
+        startupinfo, creationflags = _get_subprocess_startupinfo()
+        result = subprocess.run(
+            ffmpeg_command,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout
+            startupinfo=startupinfo,
+            creationflags=creationflags
+        )
+        
+        if result.returncode != 0:
+            raise ConversionError(f"FFmpeg failed: {result.stderr}")
+        
+        # Get duration
+        duration = get_audio_duration(output_file)
+        return output_file, duration
+        
+    except subprocess.TimeoutExpired:
+        raise ConversionError(f"Conversion timed out: {input_file}")
+    except Exception as e:
+        raise ConversionError(f"Failed to convert {input_file}: {str(e)}")
 
 
 class AudioConverter:
@@ -50,7 +121,15 @@ class AudioConverter:
             DependencyError: If FFmpeg is not found or not accessible.
         """
         try:
-            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, text=True)
+            startupinfo, creationflags = _get_subprocess_startupinfo()
+            result = subprocess.run(
+                ['ffmpeg', '-version'], 
+                capture_output=True, 
+                check=True, 
+                text=True,
+                startupinfo=startupinfo,
+                creationflags=creationflags
+            )
             logging.info('FFmpeg dependency check passed')
             
             # Extract version information
@@ -210,10 +289,12 @@ class AudioConverter:
             conversion_context = nullcontext()
         
         with conversion_context as conversion_progress:
-            with ProcessPoolExecutor(max_workers=cores) as executor:
-                # Create tasks
+            # Use proper multiprocessing context for PyInstaller compatibility
+            mp_context = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(max_workers=cores, mp_context=mp_context) as executor:
+                # Create tasks using module-level worker function
                 future_to_file = {
-                    executor.submit(self._convert_file_for_concatenation, input_file, temp_dir, bitrate): input_file
+                    executor.submit(_convert_file_worker, (input_file, temp_dir, bitrate)): input_file
                     for input_file in input_files
                 }
                 
@@ -368,12 +449,15 @@ class AudioConverter:
             '-loglevel', 'error', '-stats'
         ]
         
+        startupinfo, creationflags = _get_subprocess_startupinfo()
         process = subprocess.Popen(
             ffmpeg_command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
-            bufsize=1
+            bufsize=1,
+            startupinfo=startupinfo,
+            creationflags=creationflags
         )
         
         # Progress tracking patterns
@@ -421,11 +505,14 @@ class AudioConverter:
         ]
         
         try:
+            startupinfo, creationflags = _get_subprocess_startupinfo()
             result = subprocess.run(
                 ffmpeg_command,
                 capture_output=True,
                 text=True,
-                timeout=300  # 5 minute timeout
+                timeout=300,  # 5 minute timeout
+                startupinfo=startupinfo,
+                creationflags=creationflags
             )
             
             if result.returncode != 0:
